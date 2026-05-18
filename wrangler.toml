@@ -1,0 +1,10 @@
+name = "gitlab-ssrf-scanner"
+main = "src/index.ts"
+compatibility_date = "2025-01-01"
+
+# Free tier limits: 100k requests/day, 10ms CPU/request
+# This worker only does 302 redirects — well within limits
+
+[observability]
+enabled = true
+head_sampling_rate = 1
