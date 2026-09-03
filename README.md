@@ -1,79 +1,104 @@
-# Generic Webhook API
+# hooks — generic testing collector
 
-Cloudflare Worker providing a generic webhook API with payload generation
-for security testing (SSRF, XSS) and general webhook consumption.
+A Cloudflare Worker that gives a payload somewhere to point and a place to
+watch for it arriving. Nothing here is tied to a particular target; the
+per-target harnesses that used to live here are on the `archive/old-targets`
+branch.
 
-Originally built for GitLab SSRF scanning via `include:remote:` CI pipelines.
+Use it only against systems you are authorised to test.
 
-## Endpoints
+## Out-of-band collector
 
-### Health
+A tool plants a unique token and watches here for it. The request that lands is
+the evidence, so everything about it is recorded: method, URL, IP, ASN,
+country, colo, the interesting headers, query parameters and a body preview.
+`Authorization` and `Cookie` are kept deliberately — when a target sends those
+to a third-party collector, that is the finding.
 
-| Path | Description |
-|------|-------------|
-| `/`  | API index with all available endpoints |
+| Form | Use |
+|---|---|
+| `/oob/<token>` | Works with the DNS that exists today |
+| `/oob/<token>.gif` | Answers a 1x1 GIF, so a callback can ride in an `<img>` |
+| `/oob/<token>.js` | Answers JavaScript, for `<script src>` |
+| `/oob?token=<token>` | For payloads that cannot carry a path |
+| `<token>.hooks.…` | Fires on DNS resolution alone — needs a wildcard record |
+| `/oob/hits?token=<token>` | What called back |
 
-### GitLab SSRF Scanner
+The host form is worth enabling: it fires when the target can resolve a name
+even if it cannot make an outbound HTTP request, which catches cases the path
+form misses. It needs a wildcard DNS record and a matching worker route.
 
-| Path | Description |
-|------|-------------|
-| `/gitlab/scan.yml` | 302 redirect to next internal target (cycles) |
-| `/gitlab/status`   | Current scan position |
-| `/gitlab/reset`    | Reset scanner to target #1 |
-| `/gitlab/targets`  | List all scan targets |
+Responses are always JSON, a GIF, or a JS comment — never the caller's own
+content reflected back. A collector that echoed input as HTML would be an XSS
+gadget aimed at whoever reads the results.
 
-### SSRF
+### Storage
 
-| Path | Description |
-|------|-------------|
-| `/ssrf?url=<target>` | 302 redirect to any URL |
-| `/ssrf-include-remote.yml?target=<callback>` | GitLab `include:remote:` YAML payload |
+Without a KV binding, hits go to observability logs only and `/oob/hits`
+returns `501` rather than an empty list. An empty list would read as "nothing
+called back", which is the one answer it must never give when it cannot know.
 
-### XSS
-
-| Path | Description |
-|------|-------------|
-| `/xss?payload=<script>alert(1)</script>` | Reflected XSS payload (HTML page) |
-
-### Generic Payloads
-
-| Path | Description |
-|------|-------------|
-| `/json?callback=<fn>` | JSON response (JSONP if callback provided) |
-| `/yaml` | YAML response |
-| `/xml` | XML response |
-| `/html?title=<title>` | HTML page |
-| `/js?callback=<fn>` | JavaScript payload |
-
-## Deploy
+To make hits queryable — which is what lets a scanner confirm a callback
+without a human opening the dashboard:
 
 ```bash
-npm install
-npx wrangler login
-npm run deploy
+npx wrangler kv namespace create OOB
+# add the returned id to wrangler.toml as a kv_namespaces binding named OOB
 ```
 
-## Local Dev
+## Prompt injection documents
+
+Direct injection is mostly a curiosity. The payable version is indirect:
+content a model ingests without a human reading it first. The instruction has
+to survive whatever pipeline carries it, so the same payload is offered in the
+formats those pipelines accept.
+
+| Endpoint | Where the instruction hides |
+|---|---|
+| `/ai/inject.txt?token=<t>` | Plain text, the usual RAG chunk |
+| `/ai/inject.md?token=<t>` | An HTML comment — invisible in rendered markdown |
+| `/ai/inject.html?token=<t>` | Off-screen and zero-size elements: in the DOM, not on screen |
+| `/ai/inject.json?token=<t>` | A free-text record field, where user content lives |
+| `/ai/robots-inject.txt?token=<t>` | `robots.txt`, for crawlers that feed it to a model as guidance |
+| `/ai/tool-poison.json?token=<t>` | An MCP `tools/list` whose tool *description* carries the instruction |
+
+Every payload asks the model to fetch its own `/oob/<token>` URL. That is the
+point: a model repeating a phrase proves it read the text, while a request
+arriving at the collector proves it acted, and only the second is worth
+reporting.
+
+`tool-poison.json` is the supply-chain form. An agent that trusts a third-party
+MCP server reads tool descriptions into its own context, so a description is
+executable text in practice — and the poisoning usually arrives as a
+description change on a server that was previously benign.
+
+None of these instructions asks for a write, a purchase, or a message to a
+third party. Keep it that way.
+
+## SSRF
+
+| Endpoint | Use |
+|---|---|
+| `/ssrf?url=<target>` | Plain 302 |
+| `/ssrf/sweep.yml?hosts=a:80,b:443&token=<t>` | A document referencing each host, for SSRF that runs through a parser. Hosts come from the caller, capped at 25 |
+| `/ssrf-include-remote.yml?target=<url>` | Remote-include chain |
+| `/ssrf-chained.yml` | Multi-stage CI-shaped chain |
+
+Each sweep entry also calls the collector, so a fetch that succeeds is visible
+even when the response never reaches you.
+
+## XSS and content-type payloads
+
+`/xss?payload=…`, `/json?callback=…`, `/yaml`, `/xml`, `/html?title=…`,
+`/js?callback=…`.
+
+These reflect what you pass them, by design — they exist to be loaded by a
+target, not to be visited by anyone else.
+
+## Development
 
 ```bash
-npm run dev          # wrangler dev (local server)
-npm run typecheck    # TypeScript type checking
-npm run logs         # tail production logs
+npx wrangler dev --local     # http://127.0.0.1:8787
+npx tsc --noEmit             # typecheck
+npx wrangler deploy          # ship it
 ```
-
-## GitLab SSRF Workflow
-
-1. Deploy this worker
-2. Point `.gitlab-ci.yml` at `https://your-worker.workers.dev/gitlab/scan.yml`
-   or use the remote include: `include: remote: "https://your-worker.workers.dev/ssrf-include-remote.yml"`
-3. Each pipeline triggers fetch → 302 redirect to next internal target
-4. Monitor pipeline errors to detect live services
-
-### Signal Interpretation
-
-| Pipeline Error | Meaning |
-|----------------|---------|
-| `Invalid configuration format` | **SERVICE FOUND** — port open, responded (non-YAML) |
-| `timeout error` after 3 attempts | Firewall drop or dead IP |
-| `connection refused` | IP alive, port closed |
-| `blocked/not allowed` | UrlBlocker blocked the IP |

