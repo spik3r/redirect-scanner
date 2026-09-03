@@ -3,7 +3,14 @@ main = "src/index.ts"
 compatibility_date = "2025-01-01"
 
 # Free tier limits: 100k requests/day, 10ms CPU/request
-# This worker only does 302 redirects — well within limits
+# Payload generation and redirects are well within them.
+
+# Out-of-band callback storage. Without this binding /oob/hits returns 501
+# rather than an empty list, because an empty list reads as "nothing called
+# back" — the one answer it must never give when it cannot know.
+[[kv_namespaces]]
+binding = "OOB"
+id = "a8a9e2197170498ab375a1719bb74c28"
 
 [observability]
 enabled = true
