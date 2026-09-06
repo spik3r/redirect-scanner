@@ -118,7 +118,10 @@ function extractToken(url: URL): { token: string; via: OobHit["via"] } | null {
   // matches the token pattern; treating that as a token would classify every
   // request to the site as a callback and answer JSON to all of them.
   const parts = url.hostname.split(".");
-  if (parts.length >= 4 && TOKEN_RE.test(parts[0])) {
+  // Only accept the documented <token>.hooks.<domain> shape. Treating every
+  // four-label hostname as a callback swallows the Worker's own
+  // <name>.<account>.workers.dev URL.
+  if (parts.length >= 4 && parts[1] === "hooks" && TOKEN_RE.test(parts[0])) {
     return { token: parts[0], via: "host" };
   }
   return null;
