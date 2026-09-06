@@ -1,7 +1,9 @@
 import { baseLog, logEntry } from "./lib/log";
 import { handleOob, type OobEnv } from "./handlers/oob";
 import {
+  canaryText,
   injectText,
+  injectSoftText,
   injectMarkdown,
   injectHtml,
   injectJson,
@@ -42,7 +44,9 @@ export default {
     }
 
     // ── Prompt injection documents ─────────────────────────────
+    if (path === "/ai/canary.txt") return canaryText(request);
     if (path === "/ai/inject.txt") return injectText(request);
+    if (path === "/ai/inject-soft.txt") return injectSoftText(request);
     if (path === "/ai/inject.md") return injectMarkdown(request);
     if (path === "/ai/inject.html") return injectHtml(request);
     if (path === "/ai/inject.json") return injectJson(request);
@@ -84,7 +88,9 @@ export default {
                 "<token>.<this host>         host form (needs a wildcard DNS record)",
               ],
               ai: [
+                "/ai/canary.txt?token=<t>    benign retrieval control",
                 "/ai/inject.txt?token=<t>     injection in plain text, the usual RAG chunk",
+                "/ai/inject-soft.txt?token=   secondary fetch without a classic jailbreak phrase",
                 "/ai/inject.md?token=<t>      injection hidden in an HTML comment",
                 "/ai/inject.html?token=<t>    injection invisible on screen, present in the DOM",
                 "/ai/inject.json?token=<t>    injection in a free-text record field",
