@@ -2,6 +2,17 @@ name = "redirect-scanner"
 main = "src/index.ts"
 compatibility_date = "2025-01-01"
 
+# Keep both operator-controlled hostnames on the same fixed fixture handler.
+# Listing the existing domain here prevents Wrangler from replacing it when
+# adding the alternate custom domain.
+[[routes]]
+pattern = "hooks.mement0rq.com"
+custom_domain = true
+
+[[routes]]
+pattern = "fixtures-alt.mement0rq.com"
+custom_domain = true
+
 # Free tier limits: 100k requests/day, 10ms CPU/request
 # Payload generation and redirects are well within them.
 
