@@ -171,6 +171,9 @@ describe("oob callback routes", () => {
     const created = await handleOob(makeReq("/oob/admin/responses", { method: "POST", headers: { ...adminHeaders(), "content-type": "application/json" }, body: JSON.stringify(payload) }), env as never);
     const result = await created?.json(); const first = await handleOob(makeReq(new URL(result.public_url).pathname), env as never);
     expect(first?.status).toBe(302); expect(first?.headers.get("location")).toContain(`/r/${token("u")}/1`);
+    const evidence = await handleOob(makeReq(`/oob/admin/hits?token=${payload.callback_token}`, { headers: adminHeaders() }), env as never);
+    const redirectHit = (await evidence?.json())?.hits?.find((hit: { response_location?: string }) => hit.response_location);
+    expect(redirectHit?.response_location).toContain(`/r/${token("u")}/1`);
     const second = await handleOob(makeReq(new URL(first?.headers.get("location") || "").pathname), env as never);
     expect(second?.headers.get("location")).toBe(payload.destination);
   });

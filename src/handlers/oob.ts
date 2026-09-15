@@ -116,6 +116,7 @@ export interface OobHit {
   body_truncated: boolean;
   content_type: string;
   response_status?: number;
+  response_location?: string;
   request_id?: string;
   trace_id?: string;
   cf_ray?: string;
@@ -873,14 +874,15 @@ async function serveResponsePlan(request: Request, env: OobEnv, config: ReturnTy
     const remaining = Math.max(60, Math.floor((Date.parse(plan.expires_at) - Date.now()) / 1000));
     await env.OOB.put(`${RESPONSE_PLAN_PREFIX}${startToken}`, JSON.stringify(plan), { expirationTtl: remaining });
   }
+  const location = plan.redirect_hops > hop ? (hop + 1 < plan.redirect_hops ? `${url.origin}/r/${plan.start_token}/${hop + 1}` : plan.destination) : undefined;
   const hit = await buildRecord(request, plan.callback_token, "callback_hit", config, plan.redirect_hops > hop ? plan.redirect_status : (request.method === "HEAD" ? plan.head.status : plan.get.status));
+  hit.response_location = location;
   hit.redirect_chain_id = plan.start_token;
   hit.redirect_hop = hop + 1;
   hit.redirect_hops_total = plan.redirect_hops + 1;
   await recordHit(env, config, hit);
   if (plan.redirect_hops > hop) {
-    const location = hop + 1 < plan.redirect_hops ? `${url.origin}/r/${plan.start_token}/${hop + 1}` : plan.destination;
-    return new Response(null, { status: plan.redirect_status, headers: { Location: location, "Cache-Control": "no-store", "X-Route": "response-plan" } });
+    return new Response(null, { status: plan.redirect_status, headers: { Location: location!, "Cache-Control": "no-store", "X-Route": "response-plan" } });
   }
   return responseFromSpec(request.method === "HEAD" ? plan.head : plan.get, request.method);
 }
