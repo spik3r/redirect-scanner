@@ -30,7 +30,10 @@ const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
 
 export const fixtureDefinitions: FixtureDefinition[] = [
   ...[...FIXTURES.entries()].map(([path, fixture]) => ({ path, description: fixture.description })),
-  ...[301, 302, 303, 307, 308].flatMap((status) => Object.entries(REDIRECT_TARGETS).map(([name, target]) => ({ path: `/fixtures/redirect/${status}/${name}`, description: `${status} same-origin redirect to ${target}.` }))),
+  ...[301, 302, 303, 307, 308].flatMap((status) => Object.entries(REDIRECT_TARGETS).flatMap(([name, target]) => [
+    { path: `/fixtures/redirect/${status}/${name}`, description: `${status} same-origin redirect to ${target}.` },
+    { path: `/fixtures/redirect/${status}/${name}.gif`, description: `${status} same-origin redirect alias ending in .gif to ${target}.` },
+  ])),
 ];
 
 export function handleFixture(request: Request): Response | null {
@@ -42,7 +45,7 @@ export function handleFixture(request: Request): Response | null {
   const fixture = FIXTURES.get(url.pathname);
   if (fixture) return fixtureResponse(request, fixture.body, 200, fixture.id, { "Content-Type": fixture.type, ...fixture.extra });
 
-  const match = url.pathname.match(/^\/fixtures\/redirect\/(301|302|303|307|308)\/(valid-gif|gif-octet-stream|invalid-gif)$/);
+  const match = url.pathname.match(/^\/fixtures\/redirect\/(301|302|303|307|308)\/(valid-gif|gif-octet-stream|invalid-gif)(?:\.gif)?$/);
   if (!match) return fixtureResponse(request, null, 404, "not-found", { "Content-Type": "text/plain; charset=utf-8" });
   const status = Number(match[1]);
   if (!REDIRECT_STATUSES.has(status)) return fixtureResponse(request, null, 404, "not-found", { "Content-Type": "text/plain; charset=utf-8" });

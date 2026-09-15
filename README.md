@@ -29,7 +29,8 @@ HEAD, disables caching, and sends `X-Content-Type-Options: nosniff`.
 
 Fixed same-origin redirects are available at
 `/fixtures/redirect/{301|302|303|307|308}/{valid-gif|gif-octet-stream|invalid-gif}`.
-They accept no destination parameter.
+Equivalent aliases append `.gif` to the final path segment. They accept no
+destination parameter.
 
 ## Out-of-band collector
 

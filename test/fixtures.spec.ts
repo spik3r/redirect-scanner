@@ -45,8 +45,8 @@ describe("public media fixtures", () => {
   it("serves every fixed redirect for GET and HEAD", async () => {
     const targets = { "valid-gif": "/fixtures/valid-gif-correct-mime.gif", "gif-octet-stream": "/fixtures/valid-gif-octet-stream.gif", "invalid-gif": "/fixtures/invalid-gif-image-mime.gif" };
     for (const status of [301, 302, 303, 307, 308]) for (const [name, location] of Object.entries(targets)) {
-      for (const method of ["GET", "HEAD"]) {
-        const response = handleFixture(new Request(`${origin}/fixtures/redirect/${status}/${name}`, { method }));
+      for (const suffix of ["", ".gif"]) for (const method of ["GET", "HEAD"]) {
+        const response = handleFixture(new Request(`${origin}/fixtures/redirect/${status}/${name}${suffix}`, { method }));
         expect(response?.status).toBe(status); expect(response?.headers.get("location")).toBe(location);
         expect((await response!.arrayBuffer()).byteLength).toBe(0);
       }
@@ -58,7 +58,7 @@ describe("public media fixtures", () => {
     expect(denied?.status).toBe(405); expect(denied?.headers.get("allow")).toBe("GET, HEAD");
     const overview = handleFixture(new Request(origin + "/fixtures"));
     expect(await overview?.text()).toContain("navigator.clipboard.writeText");
-    expect(fixtureDefinitions).toHaveLength(24);
+    expect(fixtureDefinitions).toHaveLength(39);
   });
 
   it("bypasses KV and rate-limit storage in the full Worker", async () => {
