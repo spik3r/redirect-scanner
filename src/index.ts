@@ -85,6 +85,16 @@ export default {
                 "/oob/<token>.js             answers JavaScript, for <script src> callbacks",
                 "/oob?token=<token>          query form",
                 "/oob/hits?token=<token>     what called back (needs the OOB KV binding)",
+                "/oob/admin/hits?token=<token> token-scoped authenticated raw log access",
+                "/oob/admin/tokens?limit=10 latest callback tokens (authenticated)",
+                "/oob/admin/responses       create an authenticated response capability",
+                "/r/<capability>            use a provisioned GET/HEAD response or redirect chain",
+                "/redirect/<token>?to=<url>&status=302",
+                "/redirect-chain/<token>?to=<url>&hops=3&status=302",
+                "/respond/<token>?status=200&content_type=text/plain",
+                "/delay/<token>?ms=1000",
+                "/json/<token>?callback=<fn>",
+                "/js/<token>?callback=<fn>",
                 "<token>.<this host>         host form (needs a wildcard DNS record)",
               ],
               ai: [
@@ -113,7 +123,7 @@ export default {
               ],
             },
             note:
-              "Every AI payload asks the model to fetch its /oob/<token> URL. A model " +
+              "The /ai injection payloads ask the model to fetch their /oob/<token> URL. A model " +
               "repeating a phrase proves it read the text; a request arriving at the " +
               "collector proves it acted, and only the second is worth reporting.",
           },

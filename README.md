@@ -21,8 +21,18 @@ to a third-party collector, that is the finding.
 | `/oob/<token>.gif` | Answers a 1x1 GIF, so a callback can ride in an `<img>` |
 | `/oob/<token>.js` | Answers JavaScript, for `<script src>` |
 | `/oob?token=<token>` | For payloads that cannot carry a path |
+| `/oob/admin/hits?token=<token>` | Authenticated raw hits endpoint |
+| `/oob/admin/tokens?limit=10` | Authenticated list of recently active callback tokens |
+| `/oob/admin/responses` | Authenticated creation of an expiring response capability |
+| `/r/<start-token>` | Public, unguessable provisioned GET/HEAD response or redirect chain |
 | `<token>.hooks.…` | Fires on DNS resolution alone — needs a wildcard record |
 | `/oob/hits?token=<token>` | What called back |
+| `/json/<token>?callback=<fn>` | Controlled JSON response route |
+| `/js/<token>?callback=<fn>` | Controlled JS/JSONP response |
+| `/respond/<token>` | Controlled status/content/cookies/headers route |
+| `/delay/<token>` | Bounded delay response route |
+| `/redirect/<token>?to=<url>` | Controlled redirect route |
+| `/redirect-chain/<token>?to=<url>&hops=3` | Controlled redirect chain start |
 
 The host form is worth enabling: it fires when the target can resolve a name
 even if it cannot make an outbound HTTP request, which catches cases the path
@@ -108,4 +118,92 @@ target, not to be visited by anyone else.
 npx wrangler dev --local     # http://127.0.0.1:8787
 npx tsc --noEmit             # typecheck
 npx wrangler deploy          # ship it
+```
+
+## Deployment notes
+
+Keep secrets in Cloudflare bindings, not source control:
+
+```bash
+wrangler secret put ADMIN_TOKEN
+```
+
+`OOB` must be a KV namespace binding to enable persistent hit storage and token-scoped deletion.
+Set non-secret limits as Worker variables in Cloudflare or in `wrangler.toml`.
+New callback records store selected Cloudflare request metadata—network,
+location, HTTP/TLS versions, Ray/request identity—and redacted request headers
+so local evidence viewers do not need access to Cloudflare logs.
+
+## Route classes and classification
+
+- `callback_hit`: tokenized callback endpoints like `/oob/<token>`, `/json/<token>`, `/js/<token>`.
+- `hits_query`: `/oob/hits` polling.
+- `admin_request`: controlled response, redirect, and authenticated raw-log routes.
+
+## Security and privacy behaviour
+
+- Sensitive headers are redacted by default: `Authorization`, `Cookie`,
+  `Set-Cookie`, any header containing `token`, `secret`, `key`, `session`, and
+  proxy auth headers.
+- Values are preserved for `X-Research-Marker` and `X-Codex-Probe`.
+- Public `/oob/hits` responses only expose redacted metadata and omit sensitive
+  values.
+- Redirect targets are limited to `http` and `https`; unsafe schemes like
+  `javascript:`, `data:`, and `file:` are blocked.
+- Header injection is blocked in response/header query parameters.
+- CORS is intentionally not enabled.
+- No server-side URL fetching is performed.
+- No open proxy behavior in callback endpoints.
+
+## Environment bindings and tuning
+
+- `ADMIN_TOKEN`: required for `/oob/admin/hits`, `/respond`, `/delay`, `/redirect`, `/redirect-chain`.
+- Response capabilities are created through authenticated `POST /oob/admin/responses`, expire after 24 hours, and never contain the admin token. The public `/r/<start-token>` route accepts only GET and HEAD.
+- `HIT_TTL_SECONDS`: retention window (default: `604800`).
+- `MAX_HITS_PER_TOKEN`: per-token hit cap (default: `50`).
+- `MAX_BODY_BYTES`: max captured body size.
+- `MAX_BODY_PREVIEW_BYTES`: public body preview cap.
+- `MAX_REDIRECT_HOPS`: redirect hop cap.
+- `MAX_RESPONSE_BYTES`: response body cap for controlled routes.
+- `MAX_RESPONSE_HEADERS`: max custom response headers accepted as `header-*`.
+- `MAX_REQUESTS_PER_MINUTE`: per-IP request limit.
+- `MAX_DELAY_MS`: response delay cap for `/respond` and `/delay`.
+- `TOKEN_MIN_LENGTH`: token length lower bound.
+- `TOKEN_MAX_LENGTH`: token length upper bound.
+- `ADMIN_TOKEN_HEADER`: optional custom admin auth header name.
+
+## Example usage
+
+```bash
+TOKEN=aaaaaaaaaaaaaaaaaaaaaaaa
+curl "https://hooks.mement0rq.com/oob/$TOKEN"         # collect callback
+curl "https://hooks.mement0rq.com/oob/hits?token=$TOKEN"
+curl -H "Authorization: Bearer <ADMIN_TOKEN>" \
+  "https://hooks.mement0rq.com/oob/admin/hits?token=$TOKEN"
+
+curl "https://hooks.mement0rq.com/respond/$TOKEN?status=200&content_type=text/plain&body=ok"
+curl "https://hooks.mement0rq.com/delay/$TOKEN?ms=1000&status=204"
+curl "https://hooks.mement0rq.com/redirect/$TOKEN?to=https%3A%2F%2Fexample.com%2Fcb&status=302"
+curl "https://hooks.mement0rq.com/redirect-chain/$TOKEN?to=https%3A%2F%2Fexample.com%2Fcb&hops=3&status=302"
+curl "https://hooks.mement0rq.com/json/$TOKEN?callback=probe"
+curl "https://hooks.mement0rq.com/js/$TOKEN?callback=probe&status=200"
+
+# Android WebView callback check
+curl "https://hooks.mement0rq.com/oob/$TOKEN?q=android-webview&state=webview"
+
+# OAuth callback check
+curl "https://hooks.mement0rq.com/oob/$TOKEN?response_type=code&state=oauth"
+```
+
+Delete token-scoped records with an authenticated admin request:
+
+```bash
+curl -X DELETE -H "Authorization: Bearer <ADMIN_TOKEN>" \
+  "https://hooks.mement0rq.com/oob/admin/hits?token=$TOKEN&hit_id=<hit-id>"
+```
+
+Filter by time and event type:
+
+```bash
+curl "https://hooks.mement0rq.com/oob/hits?token=$TOKEN&event_type=callback_hit&since=2026-09-01T00:00:00Z&until=2026-09-10T23:59:59Z"
 ```
