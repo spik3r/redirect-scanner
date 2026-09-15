@@ -143,6 +143,7 @@ interface RecentTokenStorage {
 const RECENT_TOKENS_KEY = "recent:tokens";
 const MAX_RECENT_TOKENS = 50;
 const RESPONSE_PLAN_PREFIX = "response-plan:";
+const RESPONSE_PLAN_INDEX = "response-plans:recent";
 const MAX_RESPONSE_PLAN_BODY_BYTES = 8 * 1024;
 const MAX_RESPONSE_PLAN_HOPS = 8;
 const RESPONSE_PLAN_TTL_SECONDS = 24 * 60 * 60;
@@ -164,6 +165,11 @@ interface ResponsePlan {
   get: ResponseSpec;
   head: ResponseSpec;
   created_at: string;
+  expires_at: string;
+  max_uses: number;
+  uses: number;
+  allow_http: boolean;
+  allowed_hosts: string[];
 }
 
 const FORBIDDEN_RESPONSE_HEADERS = new Set([
@@ -779,15 +785,44 @@ function responseFromSpec(spec: ResponseSpec, method: string): Response {
   return new Response(method === "HEAD" ? null : spec.body, { status: spec.status, headers });
 }
 
-async function provisionResponsePlan(request: Request, env: OobEnv, config: ReturnType<typeof getEnvConfig>): Promise<Response> {
+function publicPlan(plan: ResponsePlan, origin: string) {
+  return { ...plan, get: { ...plan.get, body: plan.get.body }, head: { ...plan.head, body: "" }, public_url: `${origin}/r/${plan.start_token}` };
+}
+
+async function updatePlanIndex(env: OobEnv, plan: ResponsePlan | null, removeToken = ""): Promise<void> {
+  const stored = await env.OOB?.get<{ tokens: string[] }>(RESPONSE_PLAN_INDEX, "json");
+  let tokens = (stored?.tokens || []).filter((token) => token !== removeToken && token !== plan?.start_token);
+  if (plan) tokens = [plan.start_token, ...tokens].slice(0, MAX_RECENT_TOKENS);
+  await env.OOB?.put(RESPONSE_PLAN_INDEX, JSON.stringify({ tokens }), { expirationTtl: RESPONSE_PLAN_TTL_SECONDS });
+}
+
+async function manageResponsePlans(request: Request, env: OobEnv, config: ReturnType<typeof getEnvConfig>): Promise<Response> {
   if (!isAdminRequest(request, env)) return jsonResponse({ error: "missing or invalid admin credentials" }, 401);
   if (!env.OOB) return jsonResponse({ error: "storage unavailable" }, 501);
-  if (request.method.toUpperCase() !== "POST") return jsonResponse({ error: "method not allowed" }, 405);
+  const url = new URL(request.url);
+  const id = url.pathname.split("/").filter(Boolean)[3] || "";
+  if (request.method === "GET") {
+    if (id) {
+      const plan = await env.OOB.get<ResponsePlan>(`${RESPONSE_PLAN_PREFIX}${id}`, "json");
+      return plan ? jsonResponse(publicPlan(plan, url.origin)) : jsonResponse({ error: "response preset not found" }, 404);
+    }
+    const index = await env.OOB.get<{ tokens: string[] }>(RESPONSE_PLAN_INDEX, "json");
+    const plans = (await Promise.all((index?.tokens || []).map((token) => env.OOB?.get<ResponsePlan>(`${RESPONSE_PLAN_PREFIX}${token}`, "json")))).filter(Boolean).map((plan) => publicPlan(plan as ResponsePlan, url.origin));
+    return jsonResponse({ count: plans.length, presets: plans });
+  }
+  if (request.method === "DELETE") {
+    const token = parseToken(id, config); if (!token) return jsonResponse({ error: "valid preset ID required" }, 400);
+    await env.OOB.delete(`${RESPONSE_PLAN_PREFIX}${token}`); await updatePlanIndex(env, null, token);
+    return jsonResponse({ deleted: true, start_token: token });
+  }
+  if (request.method !== "POST" && request.method !== "PUT") return jsonResponse({ error: "method not allowed" }, 405);
   let input: Record<string, unknown>;
   try { input = await request.json<Record<string, unknown>>(); } catch { return jsonResponse({ error: "invalid JSON body" }, 400); }
-  const startToken = parseToken(String(input.start_token || ""), config);
-  const callbackToken = parseToken(String(input.callback_token || ""), config);
-  const finalToken = parseToken(String(input.final_token || ""), config);
+  const existing = request.method === "PUT" ? await env.OOB.get<ResponsePlan>(`${RESPONSE_PLAN_PREFIX}${id}`, "json") : null;
+  if (request.method === "PUT" && !existing) return jsonResponse({ error: "response preset not found" }, 404);
+  const startToken = parseToken(String(existing?.start_token || input.start_token || ""), config);
+  const callbackToken = parseToken(String(existing?.callback_token || input.callback_token || ""), config);
+  const finalToken = parseToken(String(existing?.final_token || input.final_token || ""), config);
   if (!startToken || !callbackToken || !finalToken) return jsonResponse({ error: "valid start, callback, and final tokens are required" }, 400);
   const redirectHops = Number(input.redirect_hops ?? 0);
   if (!Number.isInteger(redirectHops) || redirectHops < 0 || redirectHops > MAX_RESPONSE_PLAN_HOPS) return jsonResponse({ error: `redirect_hops must be between 0 and ${MAX_RESPONSE_PLAN_HOPS}` }, 400);
@@ -798,13 +833,24 @@ async function provisionResponsePlan(request: Request, env: OobEnv, config: Retu
     const validated = validateRedirectTarget(destination, new URL(request.url).origin);
     if (validated instanceof Response) return validated;
     destination = validated;
+    const parsed = new URL(destination);
+    const allowHTTP = input.allow_http === true;
+    if (parsed.protocol !== "https:" && !allowHTTP) return jsonResponse({ error: "redirect destinations must use HTTPS unless allow_http is explicitly enabled" }, 400);
+    const allowedHosts = Array.isArray(input.allowed_hosts) ? input.allowed_hosts.map(String).map((host) => host.toLowerCase().trim()).filter(Boolean) : [];
+    if (allowedHosts.length > 20 || allowedHosts.some((host) => !/^[a-z0-9.-]+$/.test(host))) return jsonResponse({ error: "invalid hostname allowlist" }, 400);
+    if (allowedHosts.length && !allowedHosts.includes(parsed.hostname.toLowerCase())) return jsonResponse({ error: "redirect destination hostname is not allowlisted" }, 400);
   }
   const defaultSpec: ResponseSpec = { status: 200, content_type: "text/plain; charset=utf-8", headers: {}, body: "ok" };
   const get = validateResponseSpec(input.get, defaultSpec); if (get instanceof Response) return get;
   const head = validateResponseSpec(input.head, { ...get, body: "" }); if (head instanceof Response) return head;
-  const plan: ResponsePlan = { start_token: startToken, callback_token: callbackToken, final_token: finalToken, redirect_hops: redirectHops, redirect_status: redirectStatus, destination, get, head, created_at: new Date().toISOString() };
-  await env.OOB.put(`${RESPONSE_PLAN_PREFIX}${startToken}`, JSON.stringify(plan), { expirationTtl: RESPONSE_PLAN_TTL_SECONDS });
-  return jsonResponse({ start_token: startToken, callback_token: callbackToken, final_token: finalToken, public_url: `${new URL(request.url).origin}/r/${startToken}`, expires_in_seconds: RESPONSE_PLAN_TTL_SECONDS });
+  const ttl = Math.min(RESPONSE_PLAN_TTL_SECONDS, Math.max(60, Number(input.expires_in_seconds || RESPONSE_PLAN_TTL_SECONDS)));
+  const maxUses = Math.min(1000, Math.max(1, Number(input.max_uses || existing?.max_uses || 20)));
+  if (!Number.isInteger(ttl) || !Number.isInteger(maxUses)) return jsonResponse({ error: "expiry and maximum uses must be integers" }, 400);
+  const now = new Date();
+  const plan: ResponsePlan = { start_token: startToken, callback_token: callbackToken, final_token: finalToken, redirect_hops: redirectHops, redirect_status: redirectStatus, destination, get, head, created_at: existing?.created_at || now.toISOString(), expires_at: new Date(now.getTime() + ttl * 1000).toISOString(), max_uses: maxUses, uses: existing?.uses || 0, allow_http: input.allow_http === true, allowed_hosts: Array.isArray(input.allowed_hosts) ? input.allowed_hosts.map(String) : [] };
+  await env.OOB.put(`${RESPONSE_PLAN_PREFIX}${startToken}`, JSON.stringify(plan), { expirationTtl: ttl });
+  await updatePlanIndex(env, plan);
+  return jsonResponse({ ...publicPlan(plan, url.origin), expires_in_seconds: ttl });
 }
 
 async function serveResponsePlan(request: Request, env: OobEnv, config: ReturnType<typeof getEnvConfig>): Promise<Response> {
@@ -817,6 +863,16 @@ async function serveResponsePlan(request: Request, env: OobEnv, config: ReturnTy
   if (!startToken || !Number.isInteger(hop) || hop < 0 || hop > MAX_RESPONSE_PLAN_HOPS) return jsonResponse({ error: "invalid response capability" }, 400);
   const plan = await env.OOB.get<ResponsePlan>(`${RESPONSE_PLAN_PREFIX}${startToken}`, "json");
   if (!plan) return jsonResponse({ error: "response capability not found or expired" }, 404);
+  plan.expires_at ||= new Date(Date.parse(plan.created_at) + RESPONSE_PLAN_TTL_SECONDS * 1000).toISOString();
+  plan.max_uses ||= 20;
+  plan.uses ||= 0;
+  if (Date.parse(plan.expires_at) <= Date.now()) return jsonResponse({ error: "response capability expired" }, 410);
+  if (hop === 0) {
+    if (plan.uses >= plan.max_uses) return jsonResponse({ error: "response capability maximum use count reached" }, 410);
+    plan.uses += 1;
+    const remaining = Math.max(60, Math.floor((Date.parse(plan.expires_at) - Date.now()) / 1000));
+    await env.OOB.put(`${RESPONSE_PLAN_PREFIX}${startToken}`, JSON.stringify(plan), { expirationTtl: remaining });
+  }
   const hit = await buildRecord(request, plan.callback_token, "callback_hit", config, plan.redirect_hops > hop ? plan.redirect_status : (request.method === "HEAD" ? plan.head.status : plan.get.status));
   hit.redirect_chain_id = plan.start_token;
   hit.redirect_hop = hop + 1;
@@ -838,12 +894,18 @@ export async function handleOob(request: Request, env: OobEnv): Promise<Response
     return jsonResponse({ error: "method not allowed" }, 405);
   }
 
-  const allowed = await checkRateLimit(env, request, config.maxRequestsPerMinute);
+  const authenticatedConsoleRead = method === "GET" && isAdminRequest(request, env) && (
+    url.pathname === "/oob/admin/tokens" ||
+    url.pathname === "/oob/admin/hits" ||
+    url.pathname === "/oob/admin/responses" ||
+    url.pathname.startsWith("/oob/admin/responses/")
+  );
+  const allowed = authenticatedConsoleRead || await checkRateLimit(env, request, config.maxRequestsPerMinute);
   if (!allowed) {
     return addRateLimitHeaders(jsonResponse({ error: "rate limit exceeded" }, 429), 0, config.maxRequestsPerMinute);
   }
 
-  if (url.pathname === "/oob/admin/responses") return provisionResponsePlan(request, env, config);
+  if (url.pathname === "/oob/admin/responses" || url.pathname.startsWith("/oob/admin/responses/")) return manageResponsePlans(request, env, config);
   if (url.pathname.startsWith("/r/")) return serveResponsePlan(request, env, config);
 
   if (url.pathname === "/oob/hits") {

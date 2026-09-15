@@ -23,7 +23,8 @@ to a third-party collector, that is the finding.
 | `/oob?token=<token>` | For payloads that cannot carry a path |
 | `/oob/admin/hits?token=<token>` | Authenticated raw hits endpoint |
 | `/oob/admin/tokens?limit=10` | Authenticated list of recently active callback tokens |
-| `/oob/admin/responses` | Authenticated creation of an expiring response capability |
+| `/oob/admin/responses` | Authenticated creation and listing of expiring response presets |
+| `/oob/admin/responses/<id>` | Authenticated read, edit, or deletion of one response preset |
 | `/r/<start-token>` | Public, unguessable provisioned GET/HEAD response or redirect chain |
 | `<token>.hooks.…` | Fires on DNS resolution alone — needs a wildcard record |
 | `/oob/hits?token=<token>` | What called back |
@@ -158,7 +159,8 @@ so local evidence viewers do not need access to Cloudflare logs.
 ## Environment bindings and tuning
 
 - `ADMIN_TOKEN`: required for `/oob/admin/hits`, `/respond`, `/delay`, `/redirect`, `/redirect-chain`.
-- Response capabilities are created through authenticated `POST /oob/admin/responses`, expire after 24 hours, and never contain the admin token. The public `/r/<start-token>` route accepts only GET and HEAD.
+- Response presets are managed through authenticated `/oob/admin/responses` routes. Creation returns a high-entropy public `/r/<start-token>` URL; that URL accepts unauthenticated GET and HEAD and never contains the admin token. Presets default to HTTPS destinations, may restrict destinations with `allowed_hosts`, expire within 24 hours, and stop after their configured `max_uses` count.
+- Authenticated read-only console routes do not write KV rate-limit counters. This keeps dashboard polling from consuming the KV write quota; callback and public routes remain rate-limited.
 - `HIT_TTL_SECONDS`: retention window (default: `604800`).
 - `MAX_HITS_PER_TOKEN`: per-token hit cap (default: `50`).
 - `MAX_BODY_BYTES`: max captured body size.

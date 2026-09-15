@@ -7,8 +7,11 @@ interface MockKVGetOptions {
 
 class MemoryKV {
   private store = new Map<string, string>();
+  reads = 0;
+  writes = 0;
 
   async get<T>(key: string, options?: MockKVGetOptions | "json" | "text"): Promise<T | null> {
+    this.reads += 1;
     const value = this.store.get(key);
     if (!value) return null;
     if (options === "json" || (typeof options === "object" && options.type === "json")) {
@@ -18,6 +21,7 @@ class MemoryKV {
   }
 
   async put(key: string, value: string): Promise<void> {
+    this.writes += 1;
     this.store.set(key, value);
   }
 
@@ -62,6 +66,15 @@ function token(char: string): string {
 }
 
 describe("oob callback routes", () => {
+  it("does not write KV rate-limit state for authenticated console reads", async () => {
+    const env = makeEnv();
+    const kv = env.OOB as MemoryKV;
+    const response = await handleOob(makeReq("/oob/admin/tokens?limit=50", { headers: adminHeaders() }), env as never);
+    expect(response?.status).toBe(200);
+    expect(kv.reads).toBe(1);
+    expect(kv.writes).toBe(0);
+  });
+
   it("classifies callback and polling events", async () => {
     const env = makeEnv();
     const id = token("a");
@@ -134,6 +147,7 @@ describe("oob callback routes", () => {
     const env = makeEnv();
     const payload = {
       start_token: token("s"), callback_token: token("c"), final_token: token("f"),
+      max_uses: 2, expires_in_seconds: 3600,
       redirect_hops: 0, redirect_status: 302, destination: "",
       get: { status: 201, content_type: "application/json", headers: { "x-test": "get" }, body: '{"ok":true}' },
       head: { status: 204, content_type: "text/plain", headers: { "x-test": "head" }, body: "not-sent" },
@@ -148,6 +162,7 @@ describe("oob callback routes", () => {
     expect(get?.status).toBe(201); expect(get?.headers.get("x-test")).toBe("get"); expect(await get?.text()).toBe('{"ok":true}');
     const head = await handleOob(makeReq(new URL(result.public_url).pathname, { method: "HEAD" }), env as never);
     expect(head?.status).toBe(204); expect(head?.headers.get("x-test")).toBe("head"); expect(await head?.text()).toBe("");
+    expect((await handleOob(makeReq(new URL(result.public_url).pathname), env as never))?.status).toBe(410);
   });
 
   it("serves bounded multi-hop response capabilities", async () => {
@@ -166,9 +181,22 @@ describe("oob callback routes", () => {
     const send = (value: unknown) => handleOob(makeReq("/oob/admin/responses", { method: "POST", headers: { ...adminHeaders(), "content-type": "application/json" }, body: JSON.stringify(value) }), env as never);
     expect((await send(base))?.status).toBe(400);
     expect((await send({ ...base, redirect_hops: 9, destination: "https://example.com" }))?.status).toBe(400);
+    expect((await send({ ...base, destination: "http://example.com" }))?.status).toBe(400);
+    expect((await send({ ...base, destination: "https://example.com", allowed_hosts: ["allowed.example"] }))?.status).toBe(400);
     expect((await send({ ...base, destination: "https://example.com", get: { ...base.get, headers: { "set-cookie": "secret=x" } } }))?.status).toBe(400);
     expect((await send({ ...base, destination: "https://example.com", get: { ...base.get, headers: { "x-test": "ok\r\ninjected: yes" } } }))?.status).toBe(400);
     expect((await send({ ...base, destination: "https://example.com", get: { ...base.get, body: "x".repeat(9000) } }))?.status).toBe(400);
+  });
+
+  it("lists, edits, and deletes response presets with admin authentication", async () => {
+    const env = makeEnv(); const id = token("p");
+    const payload = { start_token:id, callback_token:token("q"), final_token:token("r"), redirect_hops:1, redirect_status:301, destination:"https://hooks.mement0rq.com/final", allowed_hosts:["hooks.mement0rq.com"], max_uses:5, expires_in_seconds:600, get:{status:200,content_type:"text/plain",headers:{},body:"ok"}, head:{status:200,content_type:"text/plain",headers:{},body:""} };
+    const auth = { ...adminHeaders(), "content-type":"application/json" };
+    expect((await handleOob(makeReq("/oob/admin/responses",{method:"POST",headers:auth,body:JSON.stringify(payload)}),env as never))?.status).toBe(200);
+    const listed = await handleOob(makeReq("/oob/admin/responses",{headers:adminHeaders()}),env as never); expect((await listed?.json())?.presets).toHaveLength(1);
+    const edited = await handleOob(makeReq(`/oob/admin/responses/${id}`,{method:"PUT",headers:auth,body:JSON.stringify({...payload,redirect_status:308})}),env as never); expect((await edited?.json())?.redirect_status).toBe(308);
+    expect((await handleOob(makeReq(`/oob/admin/responses/${id}`,{method:"DELETE",headers:adminHeaders()}),env as never))?.status).toBe(200);
+    expect((await handleOob(makeReq(`/r/${id}`),env as never))?.status).toBe(404);
   });
 
   it("serves strict JSONP for /json and /js", async () => {
