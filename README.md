@@ -18,6 +18,7 @@ HEAD, disables caching, and sends `X-Content-Type-Options: nosniff`.
 | Endpoint | Response |
 |---|---|
 | `/fixtures/valid-gif-correct-mime.gif` | Valid 1×1 GIF as `image/gif` |
+| `/fixtures/valid-gif-no-extension` | Valid 1×1 GIF as `image/gif` with no filename extension |
 | `/fixtures/valid-gif-octet-stream.gif` | The same GIF as `application/octet-stream` |
 | `/fixtures/valid-gif-text-plain.gif` | The same GIF as `text/plain` |
 | `/fixtures/invalid-gif-image-mime.gif` | A harmless non-GIF marker as `image/gif` |
@@ -31,6 +32,13 @@ Fixed same-origin redirects are available at
 `/fixtures/redirect/{301|302|303|307|308}/{valid-gif|gif-octet-stream|invalid-gif}`.
 Equivalent aliases append `.gif` to the final path segment. They accept no
 destination parameter.
+
+For each supported status,
+`/fixtures/redirect/{status}/valid-gif-final-no-extension.gif` redirects to the
+extensionless GIF. `/fixtures/redirect/{status}/cross-host-valid-gif.gif`
+redirects to the fixed operator-controlled URL
+`https://fixtures-alt.mement0rq.com/fixtures/valid-gif-correct-mime.gif`. The
+alternate hostname must be configured as a Custom Domain on this same Worker.
 
 ## Out-of-band collector
 

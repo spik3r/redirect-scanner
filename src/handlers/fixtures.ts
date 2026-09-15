@@ -11,6 +11,7 @@ const SVG = new TextEncoder().encode('<svg xmlns="http://www.w3.org/2000/svg" wi
 
 const FIXTURES = new Map<string, { body: Uint8Array; type: string; id: string; description: string; extra?: Record<string, string> }>([
   ["/fixtures/valid-gif-correct-mime.gif", { body: GIF, type: "image/gif", id: "valid-gif-correct-mime", description: "Valid 1×1 GIF with the correct image/gif MIME type." }],
+  ["/fixtures/valid-gif-no-extension", { body: GIF, type: "image/gif", id: "valid-gif-no-extension", description: "Valid 1×1 GIF with no filename extension." }],
   ["/fixtures/valid-gif-octet-stream.gif", { body: GIF, type: "application/octet-stream", id: "valid-gif-octet-stream", description: "Valid 1×1 GIF served as application/octet-stream." }],
   ["/fixtures/valid-gif-text-plain.gif", { body: GIF, type: "text/plain", id: "valid-gif-text-plain", description: "Valid 1×1 GIF served as text/plain." }],
   ["/fixtures/invalid-gif-image-mime.gif", { body: INVALID_GIF, type: "image/gif", id: "invalid-gif-image-mime", description: "Invalid GIF marker bytes served as image/gif." }],
@@ -27,6 +28,10 @@ const REDIRECT_TARGETS: Record<string, string> = {
   "invalid-gif": "/fixtures/invalid-gif-image-mime.gif",
 };
 const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
+const SPECIAL_REDIRECT_TARGETS: Record<string, string> = {
+  "valid-gif-final-no-extension": "/fixtures/valid-gif-no-extension",
+  "cross-host-valid-gif": "https://fixtures-alt.mement0rq.com/fixtures/valid-gif-correct-mime.gif",
+};
 
 export const fixtureDefinitions: FixtureDefinition[] = [
   ...[...FIXTURES.entries()].map(([path, fixture]) => ({ path, description: fixture.description })),
@@ -34,6 +39,10 @@ export const fixtureDefinitions: FixtureDefinition[] = [
     { path: `/fixtures/redirect/${status}/${name}`, description: `${status} same-origin redirect to ${target}.` },
     { path: `/fixtures/redirect/${status}/${name}.gif`, description: `${status} same-origin redirect alias ending in .gif to ${target}.` },
   ])),
+  ...[301, 302, 303, 307, 308].flatMap((status) => Object.entries(SPECIAL_REDIRECT_TARGETS).map(([name, target]) => ({
+    path: `/fixtures/redirect/${status}/${name}.gif`,
+    description: `${status} fixed redirect to ${target}.`,
+  }))),
 ];
 
 export function handleFixture(request: Request): Response | null {
@@ -46,10 +55,13 @@ export function handleFixture(request: Request): Response | null {
   if (fixture) return fixtureResponse(request, fixture.body, 200, fixture.id, { "Content-Type": fixture.type, ...fixture.extra });
 
   const match = url.pathname.match(/^\/fixtures\/redirect\/(301|302|303|307|308)\/(valid-gif|gif-octet-stream|invalid-gif)(?:\.gif)?$/);
-  if (!match) return fixtureResponse(request, null, 404, "not-found", { "Content-Type": "text/plain; charset=utf-8" });
-  const status = Number(match[1]);
+  const specialMatch = url.pathname.match(/^\/fixtures\/redirect\/(301|302|303|307|308)\/(valid-gif-final-no-extension|cross-host-valid-gif)\.gif$/);
+  if (!match && !specialMatch) return fixtureResponse(request, null, 404, "not-found", { "Content-Type": "text/plain; charset=utf-8" });
+  const selected = match || specialMatch!;
+  const status = Number(selected[1]);
   if (!REDIRECT_STATUSES.has(status)) return fixtureResponse(request, null, 404, "not-found", { "Content-Type": "text/plain; charset=utf-8" });
-  return fixtureResponse(request, null, status, `redirect-${status}-${match[2]}`, { Location: REDIRECT_TARGETS[match[2]] });
+  const target = match ? REDIRECT_TARGETS[match[2]] : SPECIAL_REDIRECT_TARGETS[selected[2]];
+  return fixtureResponse(request, null, status, `redirect-${status}-${selected[2]}`, { Location: target });
 }
 
 function fixtureResponse(request: Request, body: Uint8Array | null, status: number, id: string, extra: Record<string, string>): Response {
