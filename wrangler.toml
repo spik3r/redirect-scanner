@@ -1,6 +1,8 @@
 name = "redirect-scanner"
 main = "src/index.ts"
 compatibility_date = "2025-01-01"
+workers_dev = true
+preview_urls = true
 
 # Keep both operator-controlled hostnames on the same fixed fixture handler.
 # Listing the existing domain here prevents Wrangler from replacing it when
