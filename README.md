@@ -40,6 +40,18 @@ redirects to the fixed operator-controlled URL
 `https://fixtures-alt.mement0rq.com/fixtures/valid-gif-correct-mime.gif`. The
 alternate hostname must be configured as a Custom Domain on this same Worker.
 
+Fixed oEmbed fixtures are listed on `/fixtures`. Discovery pages live at
+`/fixtures/oembed/page/{safe|special-title|html-canaries|malformed|wrong-mime}`
+and point to the matching `/fixtures/oembed/json/<case>` response. Redirect
+matrices cover 301, 302, 303, 307, and 308 for both page and JSON hops:
+
+- Same host: `/fixtures/oembed/redirect/<status>/{page|json}/<case>`
+- Cross host: `/fixtures/oembed/redirect/<status>/cross-host/{page|json}/<case>`
+
+All content and redirect destinations are fixed in source. The HTML canaries
+are inert strings inside a `template`; they do not fetch resources or make
+persistent changes.
+
 ## Out-of-band collector
 
 A tool plants a unique token and watches here for it. The request that lands is

@@ -57,6 +57,57 @@ describe("public media fixtures", () => {
     }
   });
 
+  it("serves deterministic oEmbed discovery pages and GET/HEAD JSON cases", async () => {
+    const cases = ["safe", "special-title", "html-canaries", "malformed", "wrong-mime"];
+    for (const name of cases) {
+      const pagePath = `/fixtures/oembed/page/${name}`;
+      const page = handleFixture(new Request(origin + pagePath))!;
+      const pageHead = handleFixture(new Request(origin + pagePath, { method: "HEAD" }))!;
+      const pageBody = await page.text();
+      expect(page.headers.get("content-type")).toBe("text/html; charset=utf-8");
+      expect(pageBody).toContain(`type="application/json+oembed"`);
+      expect(pageBody).toContain(`href="${origin}/fixtures/oembed/json/${name}"`);
+      expect((await pageHead.arrayBuffer()).byteLength).toBe(0);
+      expect([...pageHead.headers]).toEqual([...page.headers]);
+
+      const jsonPath = `/fixtures/oembed/json/${name}`;
+      const response = handleFixture(new Request(origin + jsonPath))!;
+      const head = handleFixture(new Request(origin + jsonPath, { method: "HEAD" }))!;
+      const body = await response.text();
+      expect((await head.arrayBuffer()).byteLength).toBe(0);
+      expect([...head.headers]).toEqual([...response.headers]);
+      expect(response.headers.get("cache-control")).toBe("no-store");
+      expect(response.headers.get("x-content-type-options")).toBe("nosniff");
+      expect(response.headers.get("content-type")).toBe(name === "wrong-mime" ? "text/plain; charset=utf-8" : "application/json; charset=utf-8");
+      if (name === "malformed") expect(() => JSON.parse(body)).toThrow();
+      else {
+        const value = JSON.parse(body);
+        expect(value).toMatchObject({ version: "1.0", type: "rich", provider_name: "Mement0rq Fixtures", provider_url: origin, width: 640, height: 360 });
+        if (name === "special-title") expect(value.title).toBe('Mement0rq "quotes" <angles> & ampersand — 雪 🌱');
+        if (name === "html-canaries") {
+          expect(value.html).toContain("MEMENT0RQ_HTML_CANARY_20260915");
+          expect(value.html).toContain("MEMENT0RQ_SCRIPT_CANARY_20260915");
+          expect(value.html).not.toMatch(/<script|src=|href=/i);
+        }
+      }
+    }
+  });
+
+  it("serves every fixed oEmbed redirect with exact locations", async () => {
+    const cases = ["safe", "special-title", "html-canaries", "malformed", "wrong-mime"];
+    for (const status of [301, 302, 303, 307, 308]) for (const name of cases) for (const kind of ["page", "json"]) for (const crossHost of [false, true]) {
+      const prefix = crossHost ? "cross-host/" : "";
+      const path = `/fixtures/oembed/redirect/${status}/${prefix}${kind}/${name}`;
+      const location = `${crossHost ? "https://fixtures-alt.mement0rq.com" : ""}/fixtures/oembed/${kind}/${name}`;
+      for (const method of ["GET", "HEAD"]) {
+        const response = handleFixture(new Request(origin + path, { method }))!;
+        expect(response.status).toBe(status);
+        expect(response.headers.get("location")).toBe(location);
+        expect((await response.arrayBuffer()).byteLength).toBe(0);
+      }
+    }
+  });
+
   it("serves every fixed redirect for GET and HEAD", async () => {
     const targets = { "valid-gif": "/fixtures/valid-gif-correct-mime.gif", "gif-octet-stream": "/fixtures/valid-gif-octet-stream.gif", "invalid-gif": "/fixtures/invalid-gif-image-mime.gif" };
     for (const status of [301, 302, 303, 307, 308]) for (const [name, location] of Object.entries(targets)) {
@@ -72,10 +123,17 @@ describe("public media fixtures", () => {
     const denied = handleFixture(new Request(origin + fixtureCases[0][0], { method: "POST" }));
     expect(denied?.status).toBe(405); expect(denied?.headers.get("allow")).toBe("GET, HEAD");
     const overview = handleFixture(new Request(origin + "/fixtures"));
-    expect(await overview?.text()).toContain("navigator.clipboard.writeText");
-    expect(fixtureDefinitions).toHaveLength(50);
+    const overviewBody = await overview?.text();
+    expect(overviewBody).toContain("navigator.clipboard.writeText");
+    expect(fixtureDefinitions).toHaveLength(160);
+    for (const fixture of fixtureDefinitions) {
+      expect(overviewBody).toContain(fixture.path);
+      expect(overviewBody).toContain(fixture.description);
+    }
     const deniedRedirect = handleFixture(new Request(`${origin}/fixtures/redirect/302/cross-host-valid-gif.gif`, { method: "POST" }));
     expect(deniedRedirect?.status).toBe(405);
+    const deniedOembed = handleFixture(new Request(`${origin}/fixtures/oembed/json/safe`, { method: "POST", body: "not-read" }));
+    expect(deniedOembed?.status).toBe(405);
   });
 
   it("bypasses KV and rate-limit storage in the full Worker", async () => {

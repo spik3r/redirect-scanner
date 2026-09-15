@@ -32,6 +32,11 @@ const SPECIAL_REDIRECT_TARGETS: Record<string, string> = {
   "valid-gif-final-no-extension": "/fixtures/valid-gif-no-extension",
   "cross-host-valid-gif": "https://fixtures-alt.mement0rq.com/fixtures/valid-gif-correct-mime.gif",
 };
+const OEMBED_CASES = ["safe", "special-title", "html-canaries", "malformed", "wrong-mime"] as const;
+const OEMBED_ORIGIN = "https://hooks.mement0rq.com";
+const OEMBED_ALT_ORIGIN = "https://fixtures-alt.mement0rq.com";
+
+type OembedCase = typeof OEMBED_CASES[number];
 
 export const fixtureDefinitions: FixtureDefinition[] = [
   ...[...FIXTURES.entries()].map(([path, fixture]) => ({ path, description: fixture.description })),
@@ -43,6 +48,16 @@ export const fixtureDefinitions: FixtureDefinition[] = [
     path: `/fixtures/redirect/${status}/${name}.gif`,
     description: `${status} fixed redirect to ${target}.`,
   }))),
+  ...OEMBED_CASES.flatMap((name) => [
+    { path: `/fixtures/oembed/page/${name}`, description: `oEmbed discovery page for the fixed ${name} case.` },
+    { path: `/fixtures/oembed/json/${name}`, description: `Fixed ${name} oEmbed response.` },
+  ]),
+  ...[301, 302, 303, 307, 308].flatMap((status) => OEMBED_CASES.flatMap((name) => [
+    { path: `/fixtures/oembed/redirect/${status}/page/${name}`, description: `${status} same-host redirect to the ${name} discovery page.` },
+    { path: `/fixtures/oembed/redirect/${status}/json/${name}`, description: `${status} same-host redirect to the ${name} JSON response.` },
+    { path: `/fixtures/oembed/redirect/${status}/cross-host/page/${name}`, description: `${status} cross-host redirect to the ${name} discovery page.` },
+    { path: `/fixtures/oembed/redirect/${status}/cross-host/json/${name}`, description: `${status} cross-host redirect to the ${name} JSON response.` },
+  ])),
 ];
 
 export function handleFixture(request: Request): Response | null {
@@ -54,6 +69,18 @@ export function handleFixture(request: Request): Response | null {
   const fixture = FIXTURES.get(url.pathname);
   if (fixture) return fixtureResponse(request, fixture.body, 200, fixture.id, { "Content-Type": fixture.type, ...fixture.extra });
 
+  const oembedPage = url.pathname.match(/^\/fixtures\/oembed\/page\/(safe|special-title|html-canaries|malformed|wrong-mime)$/);
+  if (oembedPage) return oembedPageResponse(request, oembedPage[1] as OembedCase);
+  const oembedJSON = url.pathname.match(/^\/fixtures\/oembed\/json\/(safe|special-title|html-canaries|malformed|wrong-mime)$/);
+  if (oembedJSON) return oembedJSONResponse(request, oembedJSON[1] as OembedCase);
+  const oembedRedirect = url.pathname.match(/^\/fixtures\/oembed\/redirect\/(301|302|303|307|308)\/(cross-host\/)?(page|json)\/(safe|special-title|html-canaries|malformed|wrong-mime)$/);
+  if (oembedRedirect) {
+    const status = Number(oembedRedirect[1]);
+    const origin = oembedRedirect[2] ? OEMBED_ALT_ORIGIN : "";
+    const destination = `${origin}/fixtures/oembed/${oembedRedirect[3]}/${oembedRedirect[4]}`;
+    return fixtureResponse(request, null, status, `oembed-redirect-${status}-${oembedRedirect[2] ? "cross-host-" : ""}${oembedRedirect[3]}-${oembedRedirect[4]}`, { Location: destination });
+  }
+
   const match = url.pathname.match(/^\/fixtures\/redirect\/(301|302|303|307|308)\/(valid-gif|gif-octet-stream|invalid-gif)(?:\.gif)?$/);
   const specialMatch = url.pathname.match(/^\/fixtures\/redirect\/(301|302|303|307|308)\/(valid-gif-final-no-extension|cross-host-valid-gif)\.gif$/);
   if (!match && !specialMatch) return fixtureResponse(request, null, 404, "not-found", { "Content-Type": "text/plain; charset=utf-8" });
@@ -62,6 +89,22 @@ export function handleFixture(request: Request): Response | null {
   if (!REDIRECT_STATUSES.has(status)) return fixtureResponse(request, null, 404, "not-found", { "Content-Type": "text/plain; charset=utf-8" });
   const target = match ? REDIRECT_TARGETS[match[2]] : SPECIAL_REDIRECT_TARGETS[selected[2]];
   return fixtureResponse(request, null, status, `redirect-${status}-${selected[2]}`, { Location: target });
+}
+
+function oembedPageResponse(request: Request, name: OembedCase): Response {
+  const href = `${OEMBED_ORIGIN}/fixtures/oembed/json/${name}`;
+  const body = new TextEncoder().encode(`<!doctype html><html><head><meta charset="utf-8"><title>Mement0rq oEmbed ${name}</title><link rel="alternate" type="application/json+oembed" href="${href}"></head><body><p>Fixed oEmbed discovery fixture: ${name}</p></body></html>`);
+  return fixtureResponse(request, body, 200, `oembed-page-${name}`, { "Content-Type": "text/html; charset=utf-8" });
+}
+
+function oembedJSONResponse(request: Request, name: OembedCase): Response {
+  if (name === "malformed") return fixtureResponse(request, new TextEncoder().encode('{"version":"1.0","type":"rich","title":'), 200, "oembed-json-malformed", { "Content-Type": "application/json; charset=utf-8" });
+  const title = name === "special-title" ? 'Mement0rq "quotes" <angles> & ampersand — 雪 🌱' : `Mement0rq oEmbed ${name}`;
+  const html = name === "html-canaries"
+    ? '<div class="mement0rq-oembed-canary"><template><span data-event-canary="onerror=alert(1)" data-script-canary="script-shaped">&lt;script&gt;MEMENT0RQ_SCRIPT_CANARY_20260915&lt;/script&gt;</span></template><p>MEMENT0RQ_HTML_CANARY_20260915</p></div>'
+    : '<div class="mement0rq-oembed">Harmless controlled oEmbed fixture</div>';
+  const body = JSON.stringify({ version: "1.0", type: "rich", title, provider_name: "Mement0rq Fixtures", provider_url: OEMBED_ORIGIN, width: 640, height: 360, html });
+  return fixtureResponse(request, new TextEncoder().encode(body), 200, `oembed-json-${name}`, { "Content-Type": name === "wrong-mime" ? "text/plain; charset=utf-8" : "application/json; charset=utf-8" });
 }
 
 function fixtureResponse(request: Request, body: Uint8Array | null, status: number, id: string, extra: Record<string, string>): Response {
