@@ -7,6 +7,30 @@ branch.
 
 Use it only against systems you are authorised to test.
 
+## Public media-validation fixtures
+
+`/fixtures` is a copyable browser overview of harmless, fixed resources for
+testing software against endpoints controlled by the operator. Fixture requests
+bypass callback collection and rate limiting: they do not read or write KV,
+Durable Objects, analytics storage, or request logs. Each route accepts GET and
+HEAD, disables caching, and sends `X-Content-Type-Options: nosniff`.
+
+| Endpoint | Response |
+|---|---|
+| `/fixtures/valid-gif-correct-mime.gif` | Valid 1×1 GIF as `image/gif` |
+| `/fixtures/valid-gif-octet-stream.gif` | The same GIF as `application/octet-stream` |
+| `/fixtures/valid-gif-text-plain.gif` | The same GIF as `text/plain` |
+| `/fixtures/invalid-gif-image-mime.gif` | A harmless non-GIF marker as `image/gif` |
+| `/fixtures/valid-gif-wrong-extension.txt` | Valid GIF bytes with a `.txt` extension |
+| `/fixtures/valid-png-correct-mime.png` | Valid 1×1 PNG as `image/png` |
+| `/fixtures/svg-image.svg` | Static rectangle and text with no active content |
+| `/fixtures/html-as-image.gif` | Harmless HTML marker as `image/gif` |
+| `/fixtures/oversized-declared-gif.gif` | Small valid GIF control without a false `Content-Length` |
+
+Fixed same-origin redirects are available at
+`/fixtures/redirect/{301|302|303|307|308}/{valid-gif|gif-octet-stream|invalid-gif}`.
+They accept no destination parameter.
+
 ## Out-of-band collector
 
 A tool plants a unique token and watches here for it. The request that lands is

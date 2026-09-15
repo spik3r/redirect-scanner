@@ -1,5 +1,6 @@
 import { baseLog, logEntry } from "./lib/log";
 import { handleOob, type OobEnv } from "./handlers/oob";
+import { fixtureDefinitions, handleFixture } from "./handlers/fixtures";
 import {
   canaryText,
   injectText,
@@ -33,6 +34,13 @@ export default {
   async fetch(request: Request, env: OobEnv): Promise<Response> {
     const url = new URL(request.url);
     const path = url.pathname;
+
+    // Fixed public fixtures bypass the collector entirely: no logs, rate-limit
+    // counters, or storage calls.
+    {
+      const res = handleFixture(request);
+      if (res) return res;
+    }
     const log = baseLog(request);
 
     // ── OOB collector ──────────────────────────────────────────
@@ -121,6 +129,10 @@ export default {
                 "/xml",
                 "/html?title=<title>",
                 "/js?callback=<fn>",
+              ],
+              fixtures: [
+                "/fixtures                     copyable fixture overview",
+                ...fixtureDefinitions.map((fixture) => `${fixture.path}  ${fixture.description}`),
               ],
             },
             note:
