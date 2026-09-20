@@ -1,79 +1,335 @@
-# Generic Webhook API
+# hooks — generic testing collector
 
-Cloudflare Worker providing a generic webhook API with payload generation
-for security testing (SSRF, XSS) and general webhook consumption.
+A Cloudflare Worker that gives a payload somewhere to point and a place to
+watch for it arriving. Nothing here is tied to a particular target; the
+per-target harnesses that used to live here are on the `archive/old-targets`
+branch.
 
-Originally built for GitLab SSRF scanning via `include:remote:` CI pipelines.
+Use it only against systems you are authorised to test.
 
-## Endpoints
+## Public media-validation fixtures
 
-### Health
+`/fixtures` is a copyable browser overview of harmless, fixed resources for
+testing software against endpoints controlled by the operator. Fixture requests
+bypass callback collection and rate limiting: they do not read or write KV,
+Durable Objects, analytics storage, or request logs. Each route accepts GET and
+HEAD, disables caching, and sends `X-Content-Type-Options: nosniff`.
 
-| Path | Description |
-|------|-------------|
-| `/`  | API index with all available endpoints |
+| Endpoint | Response |
+|---|---|
+| `/fixtures/valid-gif-correct-mime.gif` | Valid 1×1 GIF as `image/gif` |
+| `/fixtures/valid-gif-no-extension` | Valid 1×1 GIF as `image/gif` with no filename extension |
+| `/fixtures/valid-gif-octet-stream.gif` | The same GIF as `application/octet-stream` |
+| `/fixtures/valid-gif-text-plain.gif` | The same GIF as `text/plain` |
+| `/fixtures/invalid-gif-image-mime.gif` | A harmless non-GIF marker as `image/gif` |
+| `/fixtures/valid-gif-wrong-extension.txt` | Valid GIF bytes with a `.txt` extension |
+| `/fixtures/valid-png-correct-mime.png` | Valid 1×1 PNG as `image/png` |
+| `/fixtures/svg-image.svg` | Static rectangle and text with no active content |
+| `/fixtures/html-as-image.gif` | Harmless HTML marker as `image/gif` |
+| `/fixtures/oversized-declared-gif.gif` | Small valid GIF control without a false `Content-Length` |
 
-### GitLab SSRF Scanner
+Fixed same-origin redirects are available at
+`/fixtures/redirect/{301|302|303|307|308}/{valid-gif|gif-octet-stream|invalid-gif}`.
+Equivalent aliases append `.gif` to the final path segment. They accept no
+destination parameter.
 
-| Path | Description |
-|------|-------------|
-| `/gitlab/scan.yml` | 302 redirect to next internal target (cycles) |
-| `/gitlab/status`   | Current scan position |
-| `/gitlab/reset`    | Reset scanner to target #1 |
-| `/gitlab/targets`  | List all scan targets |
+For each supported status,
+`/fixtures/redirect/{status}/valid-gif-final-no-extension.gif` redirects to the
+extensionless GIF. `/fixtures/redirect/{status}/cross-host-valid-gif.gif`
+redirects to the fixed operator-controlled URL
+`https://fixtures-alt.mement0rq.com/fixtures/valid-gif-correct-mime.gif`. The
+alternate hostname must be configured as a Custom Domain on this same Worker.
 
-### SSRF
+Fixed oEmbed fixtures are listed on `/fixtures`. Discovery pages live at
+`/fixtures/oembed/page/{safe|special-title|html-canaries|malformed|wrong-mime}`
+and point to the matching `/fixtures/oembed/json/<case>` response. Redirect
+matrices cover 301, 302, 303, 307, and 308 for both page and JSON hops:
 
-| Path | Description |
-|------|-------------|
-| `/ssrf?url=<target>` | 302 redirect to any URL |
-| `/ssrf-include-remote.yml?target=<callback>` | GitLab `include:remote:` YAML payload |
+- Same host: `/fixtures/oembed/redirect/<status>/{page|json}/<case>`
+- Cross host: `/fixtures/oembed/redirect/<status>/cross-host/{page|json}/<case>`
 
-### XSS
+All content and redirect destinations are fixed in source. The HTML canaries
+are inert strings inside a `template`; they do not fetch resources or make
+persistent changes.
 
-| Path | Description |
-|------|-------------|
-| `/xss?payload=<script>alert(1)</script>` | Reflected XSS payload (HTML page) |
+## Out-of-band collector
 
-### Generic Payloads
+A tool plants a unique token and watches here for it. The request that lands is
+the evidence, so everything about it is recorded: method, URL, IP, ASN,
+country, colo, the interesting headers, query parameters and a body preview.
+`Authorization` and `Cookie` are kept deliberately — when a target sends those
+to a third-party collector, that is the finding.
 
-| Path | Description |
-|------|-------------|
-| `/json?callback=<fn>` | JSON response (JSONP if callback provided) |
-| `/yaml` | YAML response |
-| `/xml` | XML response |
-| `/html?title=<title>` | HTML page |
-| `/js?callback=<fn>` | JavaScript payload |
+| Form | Use |
+|---|---|
+| `/oob/<token>` | Works with the DNS that exists today |
+| `/oob/<token>.gif` | Answers a 1x1 GIF, so a callback can ride in an `<img>` |
+| `/oob/<token>.js` | Answers JavaScript, for `<script src>` |
+| `/oob?token=<token>` | For payloads that cannot carry a path |
+| `/oob/admin/hits?token=<token>` | Authenticated raw hits endpoint |
+| `/oob/admin/tokens?limit=10` | Authenticated list of recently active callback tokens |
+| `/oob/admin/responses` | Authenticated creation and listing of expiring response presets |
+| `/oob/admin/responses/<id>` | Authenticated read, edit, or deletion of one response preset |
+| `/r/<start-token>` | Public, unguessable provisioned GET/HEAD response or redirect chain |
+| `<token>.hooks.…` | Fires on DNS resolution alone — needs a wildcard record |
+| `/oob/hits?token=<token>` | What called back |
+| `/json/<token>?callback=<fn>` | Controlled JSON response route |
+| `/js/<token>?callback=<fn>` | Controlled JS/JSONP response |
+| `/respond/<token>` | Controlled status/content/cookies/headers route |
+| `/delay/<token>` | Bounded delay response route |
+| `/redirect/<token>?to=<url>` | Controlled redirect route |
+| `/redirect-chain/<token>?to=<url>&hops=3` | Controlled redirect chain start |
 
-## Deploy
+The host form is worth enabling: it fires when the target can resolve a name
+even if it cannot make an outbound HTTP request, which catches cases the path
+form misses. It needs a wildcard DNS record and a matching worker route.
+
+Responses are always JSON, a GIF, or a JS comment — never the caller's own
+content reflected back. A collector that echoed input as HTML would be an XSS
+gadget aimed at whoever reads the results.
+
+### Storage
+
+Without a KV binding, hits go to observability logs only and `/oob/hits`
+returns `501` rather than an empty list. An empty list would read as "nothing
+called back", which is the one answer it must never give when it cannot know.
+
+To make hits queryable — which is what lets a scanner confirm a callback
+without a human opening the dashboard:
 
 ```bash
-npm install
-npx wrangler login
-npm run deploy
+npx wrangler kv namespace create OOB
+# add the returned id to wrangler.toml as a kv_namespaces binding named OOB
 ```
 
-## Local Dev
+## Prompt injection documents
+
+Direct injection is mostly a curiosity. The payable version is indirect:
+content a model ingests without a human reading it first. The instruction has
+to survive whatever pipeline carries it, so the same payload is offered in the
+formats those pipelines accept.
+
+| Endpoint | Where the instruction hides |
+|---|---|
+| `/ai/canary.txt?token=<t>` | Benign retrieval control with no instruction |
+| `/ai/inject.txt?token=<t>` | Plain text, the usual RAG chunk |
+| `/ai/inject-soft.txt?token=<t>` | Plain text with a softer verification request |
+| `/ai/inject.md?token=<t>` | An HTML comment — invisible in rendered markdown |
+| `/ai/inject.html?token=<t>` | Off-screen and zero-size elements: in the DOM, not on screen |
+| `/ai/inject.json?token=<t>` | A free-text record field, where user content lives |
+| `/ai/robots-inject.txt?token=<t>` | `robots.txt`, for crawlers that feed it to a model as guidance |
+| `/ai/tool-poison.json?token=<t>` | An MCP `tools/list` whose tool *description* carries the instruction |
+
+Every payload asks the model to fetch its own `/oob/<token>` URL. That is the
+point: a model repeating a phrase proves it read the text, while a request
+arriving at the collector proves it acted, and only the second is worth
+reporting.
+
+Use `/ai/canary.txt` first. If the assistant cannot repeat its token, the
+document was not retrieved and a failed injection probe says nothing about
+instruction handling. Compare `/ai/inject-soft.txt` with `/ai/inject.txt` to
+separate phrase-based filtering from the absence of an outbound tool.
+
+`tool-poison.json` is the supply-chain form. An agent that trusts a third-party
+MCP server reads tool descriptions into its own context, so a description is
+executable text in practice — and the poisoning usually arrives as a
+description change on a server that was previously benign.
+
+None of these instructions asks for a write, a purchase, or a message to a
+third party. Keep it that way.
+
+## SSRF
+
+| Endpoint | Use |
+|---|---|
+| `/ssrf?url=<target>` | Plain 302 |
+| `/ssrf/sweep.yml?hosts=a:80,b:443&token=<t>` | A document referencing each host, for SSRF that runs through a parser. Hosts come from the caller, capped at 25 |
+| `/ssrf-include-remote.yml?target=<url>` | Remote-include chain |
+| `/ssrf-chained.yml` | Multi-stage CI-shaped chain |
+
+Each sweep entry also calls the collector, so a fetch that succeeds is visible
+even when the response never reaches you.
+
+## XSS and content-type payloads
+
+`/xss?payload=…`, `/json?callback=…`, `/yaml`, `/xml`, `/html?title=…`,
+`/js?callback=…`.
+
+These reflect what you pass them, by design — they exist to be loaded by a
+target, not to be visited by anyone else.
+
+## Development
 
 ```bash
-npm run dev          # wrangler dev (local server)
-npm run typecheck    # TypeScript type checking
-npm run logs         # tail production logs
+npx wrangler dev --local     # http://127.0.0.1:8787
+npx tsc --noEmit             # typecheck
+npx wrangler deploy          # ship it
 ```
 
-## GitLab SSRF Workflow
+## Deployment notes
 
-1. Deploy this worker
-2. Point `.gitlab-ci.yml` at `https://your-worker.workers.dev/gitlab/scan.yml`
-   or use the remote include: `include: remote: "https://your-worker.workers.dev/ssrf-include-remote.yml"`
-3. Each pipeline triggers fetch → 302 redirect to next internal target
-4. Monitor pipeline errors to detect live services
+Keep secrets in Cloudflare bindings, not source control:
 
-### Signal Interpretation
+```bash
+wrangler secret put ADMIN_TOKEN
+```
 
-| Pipeline Error | Meaning |
-|----------------|---------|
-| `Invalid configuration format` | **SERVICE FOUND** — port open, responded (non-YAML) |
-| `timeout error` after 3 attempts | Firewall drop or dead IP |
-| `connection refused` | IP alive, port closed |
-| `blocked/not allowed` | UrlBlocker blocked the IP |
+`OOB` must be a KV namespace binding to enable persistent hit storage and token-scoped deletion.
+Set non-secret limits as Worker variables in Cloudflare or in `wrangler.toml`.
+New callback records store selected Cloudflare request metadata—network,
+location, HTTP/TLS versions, Ray/request identity—and redacted request headers
+so local evidence viewers do not need access to Cloudflare logs.
+
+## Route classes and classification
+
+- `callback_hit`: tokenized callback endpoints like `/oob/<token>`, `/json/<token>`, `/js/<token>`.
+- `hits_query`: `/oob/hits` polling.
+- `admin_request`: controlled response, redirect, and authenticated raw-log routes.
+
+## Security and privacy behaviour
+
+- Sensitive headers are redacted by default: `Authorization`, `Cookie`,
+  `Set-Cookie`, any header containing `token`, `secret`, `key`, `session`, and
+  proxy auth headers.
+- Values are preserved for `X-Research-Marker` and `X-Codex-Probe`.
+- Public `/oob/hits` responses only expose redacted metadata and omit sensitive
+  values.
+- Redirect targets are limited to `http` and `https`; unsafe schemes like
+  `javascript:`, `data:`, and `file:` are blocked.
+- Header injection is blocked in response/header query parameters.
+- CORS is intentionally not enabled.
+- No server-side URL fetching is performed.
+- No open proxy behavior in callback endpoints.
+
+## Environment bindings and tuning
+
+- `ADMIN_TOKEN`: required for `/oob/admin/hits`, `/respond`, `/delay`, `/redirect`, `/redirect-chain`.
+- Response presets are managed through authenticated `/oob/admin/responses` routes. Creation returns a high-entropy public `/r/<start-token>` URL; that URL accepts unauthenticated GET and HEAD and never contains the admin token. Presets default to HTTPS destinations, may restrict destinations with `allowed_hosts`, expire within 24 hours, and stop after their configured `max_uses` count.
+- The in-Worker KV rate limiter is disabled by default because edge rate limiting handles abuse without spending KV operations. Set `SKIP_RATE_LIMIT=false` to re-enable it.
+- Recent-token indexing is disabled by default. Set `SKIP_RECENT_TOKENS=false` to maintain `/oob/admin/tokens`; this costs one extra KV read and write for each callback hit.
+- Hit polling and authenticated log reads write to observability logs but do not write audit events back to KV.
+- Once a token reaches `MAX_HITS_PER_TOKEN`, later hits remain in observability logs but stop rewriting that token's KV record.
+- `HIT_TTL_SECONDS`: retention window (default: `604800`).
+- `MAX_HITS_PER_TOKEN`: per-token hit cap (default: `50`).
+- `MAX_BODY_BYTES`: max captured body size.
+- `MAX_BODY_PREVIEW_BYTES`: public body preview cap.
+- `MAX_REDIRECT_HOPS`: redirect hop cap.
+- `MAX_RESPONSE_BYTES`: response body cap for controlled routes.
+- `MAX_RESPONSE_HEADERS`: max custom response headers accepted as `header-*`.
+- `MAX_REQUESTS_PER_MINUTE`: per-IP request limit.
+- `SKIP_RATE_LIMIT`: defaults to `true`; use `false` or `0` to enable the KV-backed limiter.
+- `SKIP_RECENT_TOKENS`: defaults to `true`; use `false` or `0` to maintain the recent-token index.
+- `MAX_DELAY_MS`: response delay cap for `/respond` and `/delay`.
+- `TOKEN_MIN_LENGTH`: token length lower bound.
+- `TOKEN_MAX_LENGTH`: token length upper bound.
+- `TOKEN_HMAC_SECRET`: shared secret used to issue and verify `s1_…` callback tokens. Use at least 32 random characters and store it with `wrangler secret put TOKEN_HMAC_SECRET`.
+- `REQUIRE_SIGNED_TOKENS`: defaults to `false`. Set to `true` only after every token producer has the same secret; valid-looking forged tokens are then rejected before KV access.
+- `ADMIN_TOKEN_HEADER`: optional custom admin auth header name.
+
+### Signed-token rollout
+
+Deploy this Worker and the updated Monstera token producers before enforcing signatures. A dedicated signing secret is preferable, but an existing 32-or-more-character `MONSTERA_OOB_ADMIN_TOKEN` can be reused during migration:
+
+```bash
+# Dedicated secret: enter the same value at both prompts.
+npx wrangler secret put TOKEN_HMAC_SECRET
+printf 'OOB signing secret: ' >&2
+IFS= read -r -s MONSTERA_OOB_TOKEN_SECRET
+export MONSTERA_OOB_TOKEN_SECRET
+printf '\n' >&2
+
+# Migration option: reuse the existing admin token without printing it.
+printf '%s' "$MONSTERA_OOB_ADMIN_TOKEN" | npx wrangler secret put TOKEN_HMAC_SECRET
+```
+
+Monstera reads `MONSTERA_OOB_TOKEN_SECRET` first and falls back to `MONSTERA_OOB_ADMIN_TOKEN`. Verify a scan produces `s1_…` tokens before enforcing signatures:
+
+```bash
+printf 'true' | npx wrangler secret put REQUIRE_SIGNED_TOKENS
+```
+
+Set the value back to `false` for a compatibility rollback. Do not commit either secret. `POST /oob/admin/tokens` can issue a signed token for other clients; it requires the normal admin bearer token and does not access KV.
+
+### WAF rules as code
+
+`scripts/sync-cloudflare-rules.mjs` disables the obsolete short-path rule and expands the existing rate rule across the public callback routes and callback subdomains. It matches rules by their existing names and refuses to create a duplicate rate rule.
+
+Create a custom Cloudflare API token named `monstera-oob-worker-waf-deployer` with these permissions:
+
+| Scope | Permission | Level |
+| --- | --- | --- |
+| Account | Workers Scripts | Edit |
+| Zone | Zone WAF | Edit |
+| Zone | Workers Routes | Edit |
+| Zone | Zone | Read |
+
+Limit the account resource to the account that owns the Worker and the zone resource to `mement0rq.com`. DNS, Account WAF, and Workers KV Storage permissions are not required. Leave client-IP filtering empty unless the deployment host has a stable outbound IP.
+
+Load the token without replacing other Cloudflare credentials:
+
+```bash
+printf 'Cloudflare API token: ' >&2
+IFS= read -r -s MONSTERA_OOB_CLOUDFLARE_API_TOKEN
+export MONSTERA_OOB_CLOUDFLARE_API_TOKEN
+printf '\n' >&2
+
+export CLOUDFLARE_ZONE_ID=e869a235cf6e519d44cd15464ab4746d
+export CLOUDFLARE_ACCOUNT_ID=dfa4a28a3e9aa336949a057b6684155f
+
+# Read-only preview, then apply the reviewed diff.
+npm run waf:check
+npm run waf:apply
+
+# Deploy the Worker with the same narrowly scoped token.
+CLOUDFLARE_API_TOKEN="$MONSTERA_OOB_CLOUDFLARE_API_TOKEN" npm run deploy
+```
+
+The WAF reconciler reads `MONSTERA_OOB_CLOUDFLARE_API_TOKEN` directly and falls back to `CLOUDFLARE_API_TOKEN`. `CLOUDFLARE_ZONE_ID` avoids zone lookup; use `CLOUDFLARE_ZONE_NAME` when the zone is not `mement0rq.com`. Zone lookup requires Zone Read permission. `waf:check` is read-only; `waf:apply` is the only WAF command that changes Cloudflare.
+
+After deployment, use a deliberately invalid token and an authenticated admin read as smoke tests:
+
+```bash
+curl -i https://hooks.mement0rq.com/oob/too-short
+
+TOKEN='<a valid signed callback token>'
+curl -H "Authorization: Bearer $MONSTERA_OOB_ADMIN_TOKEN" \
+  "https://hooks.mement0rq.com/oob/admin/hits?token=$TOKEN"
+```
+
+The first request should return `400` without touching KV. The second should return JSON rather than a Cloudflare block page. The KV-backed rate limiter and recent-token index remain disabled by default. Set `SKIP_RATE_LIMIT=false` or `SKIP_RECENT_TOKENS=false` only when those features are needed.
+
+## Example usage
+
+```bash
+TOKEN=aaaaaaaaaaaaaaaaaaaaaaaa
+curl "https://hooks.mement0rq.com/oob/$TOKEN"         # collect callback
+curl "https://hooks.mement0rq.com/oob/hits?token=$TOKEN"
+curl -H "Authorization: Bearer <ADMIN_TOKEN>" \
+  "https://hooks.mement0rq.com/oob/admin/hits?token=$TOKEN"
+
+curl "https://hooks.mement0rq.com/respond/$TOKEN?status=200&content_type=text/plain&body=ok"
+curl "https://hooks.mement0rq.com/delay/$TOKEN?ms=1000&status=204"
+curl "https://hooks.mement0rq.com/redirect/$TOKEN?to=https%3A%2F%2Fexample.com%2Fcb&status=302"
+curl "https://hooks.mement0rq.com/redirect-chain/$TOKEN?to=https%3A%2F%2Fexample.com%2Fcb&hops=3&status=302"
+curl "https://hooks.mement0rq.com/json/$TOKEN?callback=probe"
+curl "https://hooks.mement0rq.com/js/$TOKEN?callback=probe&status=200"
+
+# Android WebView callback check
+curl "https://hooks.mement0rq.com/oob/$TOKEN?q=android-webview&state=webview"
+
+# OAuth callback check
+curl "https://hooks.mement0rq.com/oob/$TOKEN?response_type=code&state=oauth"
+```
+
+Delete token-scoped records with an authenticated admin request:
+
+```bash
+curl -X DELETE -H "Authorization: Bearer <ADMIN_TOKEN>" \
+  "https://hooks.mement0rq.com/oob/admin/hits?token=$TOKEN&hit_id=<hit-id>"
+```
+
+Filter by time and event type:
+
+```bash
+curl "https://hooks.mement0rq.com/oob/hits?token=$TOKEN&event_type=callback_hit&since=2026-09-01T00:00:00Z&until=2026-09-10T23:59:59Z"
+```
