@@ -205,7 +205,10 @@ so local evidence viewers do not need access to Cloudflare logs.
 
 - `ADMIN_TOKEN`: required for `/oob/admin/hits`, `/respond`, `/delay`, `/redirect`, `/redirect-chain`.
 - Response presets are managed through authenticated `/oob/admin/responses` routes. Creation returns a high-entropy public `/r/<start-token>` URL; that URL accepts unauthenticated GET and HEAD and never contains the admin token. Presets default to HTTPS destinations, may restrict destinations with `allowed_hosts`, expire within 24 hours, and stop after their configured `max_uses` count.
-- Authenticated read-only console routes do not write KV rate-limit counters. This keeps dashboard polling from consuming the KV write quota; callback and public routes remain rate-limited.
+- The in-Worker KV rate limiter is disabled by default because edge rate limiting handles abuse without spending KV operations. Set `SKIP_RATE_LIMIT=false` to re-enable it.
+- Recent-token indexing is disabled by default. Set `SKIP_RECENT_TOKENS=false` to maintain `/oob/admin/tokens`; this costs one extra KV read and write for each callback hit.
+- Hit polling and authenticated log reads write to observability logs but do not write audit events back to KV.
+- Once a token reaches `MAX_HITS_PER_TOKEN`, later hits remain in observability logs but stop rewriting that token's KV record.
 - `HIT_TTL_SECONDS`: retention window (default: `604800`).
 - `MAX_HITS_PER_TOKEN`: per-token hit cap (default: `50`).
 - `MAX_BODY_BYTES`: max captured body size.
@@ -214,10 +217,86 @@ so local evidence viewers do not need access to Cloudflare logs.
 - `MAX_RESPONSE_BYTES`: response body cap for controlled routes.
 - `MAX_RESPONSE_HEADERS`: max custom response headers accepted as `header-*`.
 - `MAX_REQUESTS_PER_MINUTE`: per-IP request limit.
+- `SKIP_RATE_LIMIT`: defaults to `true`; use `false` or `0` to enable the KV-backed limiter.
+- `SKIP_RECENT_TOKENS`: defaults to `true`; use `false` or `0` to maintain the recent-token index.
 - `MAX_DELAY_MS`: response delay cap for `/respond` and `/delay`.
 - `TOKEN_MIN_LENGTH`: token length lower bound.
 - `TOKEN_MAX_LENGTH`: token length upper bound.
+- `TOKEN_HMAC_SECRET`: shared secret used to issue and verify `s1_…` callback tokens. Use at least 32 random characters and store it with `wrangler secret put TOKEN_HMAC_SECRET`.
+- `REQUIRE_SIGNED_TOKENS`: defaults to `false`. Set to `true` only after every token producer has the same secret; valid-looking forged tokens are then rejected before KV access.
 - `ADMIN_TOKEN_HEADER`: optional custom admin auth header name.
+
+### Signed-token rollout
+
+Deploy this Worker and the updated Monstera token producers before enforcing signatures. A dedicated signing secret is preferable, but an existing 32-or-more-character `MONSTERA_OOB_ADMIN_TOKEN` can be reused during migration:
+
+```bash
+# Dedicated secret: enter the same value at both prompts.
+npx wrangler secret put TOKEN_HMAC_SECRET
+printf 'OOB signing secret: ' >&2
+IFS= read -r -s MONSTERA_OOB_TOKEN_SECRET
+export MONSTERA_OOB_TOKEN_SECRET
+printf '\n' >&2
+
+# Migration option: reuse the existing admin token without printing it.
+printf '%s' "$MONSTERA_OOB_ADMIN_TOKEN" | npx wrangler secret put TOKEN_HMAC_SECRET
+```
+
+Monstera reads `MONSTERA_OOB_TOKEN_SECRET` first and falls back to `MONSTERA_OOB_ADMIN_TOKEN`. Verify a scan produces `s1_…` tokens before enforcing signatures:
+
+```bash
+printf 'true' | npx wrangler secret put REQUIRE_SIGNED_TOKENS
+```
+
+Set the value back to `false` for a compatibility rollback. Do not commit either secret. `POST /oob/admin/tokens` can issue a signed token for other clients; it requires the normal admin bearer token and does not access KV.
+
+### WAF rules as code
+
+`scripts/sync-cloudflare-rules.mjs` disables the obsolete short-path rule and expands the existing rate rule across the public callback routes and callback subdomains. It matches rules by their existing names and refuses to create a duplicate rate rule.
+
+Create a custom Cloudflare API token named `monstera-oob-worker-waf-deployer` with these permissions:
+
+| Scope | Permission | Level |
+| --- | --- | --- |
+| Account | Workers Scripts | Edit |
+| Zone | Zone WAF | Edit |
+| Zone | Workers Routes | Edit |
+| Zone | Zone | Read |
+
+Limit the account resource to the account that owns the Worker and the zone resource to `mement0rq.com`. DNS, Account WAF, and Workers KV Storage permissions are not required. Leave client-IP filtering empty unless the deployment host has a stable outbound IP.
+
+Load the token without replacing other Cloudflare credentials:
+
+```bash
+printf 'Cloudflare API token: ' >&2
+IFS= read -r -s MONSTERA_OOB_CLOUDFLARE_API_TOKEN
+export MONSTERA_OOB_CLOUDFLARE_API_TOKEN
+printf '\n' >&2
+
+export CLOUDFLARE_ZONE_ID=e869a235cf6e519d44cd15464ab4746d
+export CLOUDFLARE_ACCOUNT_ID=dfa4a28a3e9aa336949a057b6684155f
+
+# Read-only preview, then apply the reviewed diff.
+npm run waf:check
+npm run waf:apply
+
+# Deploy the Worker with the same narrowly scoped token.
+CLOUDFLARE_API_TOKEN="$MONSTERA_OOB_CLOUDFLARE_API_TOKEN" npm run deploy
+```
+
+The WAF reconciler reads `MONSTERA_OOB_CLOUDFLARE_API_TOKEN` directly and falls back to `CLOUDFLARE_API_TOKEN`. `CLOUDFLARE_ZONE_ID` avoids zone lookup; use `CLOUDFLARE_ZONE_NAME` when the zone is not `mement0rq.com`. Zone lookup requires Zone Read permission. `waf:check` is read-only; `waf:apply` is the only WAF command that changes Cloudflare.
+
+After deployment, use a deliberately invalid token and an authenticated admin read as smoke tests:
+
+```bash
+curl -i https://hooks.mement0rq.com/oob/too-short
+
+TOKEN='<a valid signed callback token>'
+curl -H "Authorization: Bearer $MONSTERA_OOB_ADMIN_TOKEN" \
+  "https://hooks.mement0rq.com/oob/admin/hits?token=$TOKEN"
+```
+
+The first request should return `400` without touching KV. The second should return JSON rather than a Cloudflare block page. The KV-backed rate limiter and recent-token index remain disabled by default. Set `SKIP_RATE_LIMIT=false` or `SKIP_RECENT_TOKENS=false` only when those features are needed.
 
 ## Example usage
 

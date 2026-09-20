@@ -6,6 +6,8 @@
     "deploy": "wrangler deploy",
     "dev": "wrangler dev",
     "logs": "wrangler tail",
+    "waf:check": "node scripts/sync-cloudflare-rules.mjs",
+    "waf:apply": "node scripts/sync-cloudflare-rules.mjs --apply",
     "test": "vitest run",
     "typecheck": "tsc --noEmit"
   },

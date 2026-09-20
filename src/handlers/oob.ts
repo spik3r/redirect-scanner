@@ -67,6 +67,10 @@ export interface OobEnv {
   OOB?: KVNamespace;
   ADMIN_TOKEN?: string;
   ADMIN_TOKEN_HEADER?: string;
+  TOKEN_HMAC_SECRET?: string;
+  REQUIRE_SIGNED_TOKENS?: string;
+  SKIP_RATE_LIMIT?: string;
+  SKIP_RECENT_TOKENS?: string;
   HIT_TTL_SECONDS?: string;
   MAX_HITS_PER_TOKEN?: string;
   MAX_BODY_BYTES?: string;
@@ -189,6 +193,16 @@ function getEnvConfig(env: OobEnv) {
     return parsed;
   };
 
+  const trueByDefault = (raw: string | undefined): boolean => {
+    if (raw === undefined) return true;
+    return !["0", "false"].includes(raw.trim().toLowerCase());
+  };
+
+  const falseByDefault = (raw: string | undefined): boolean => {
+    if (raw === undefined) return false;
+    return ["1", "true"].includes(raw.trim().toLowerCase());
+  };
+
   return {
     hitTtlSeconds: intVal(env.HIT_TTL_SECONDS, DEFAULTS.hitTtlSeconds),
     maxHitsPerToken: intVal(env.MAX_HITS_PER_TOKEN, DEFAULTS.maxHitsPerToken),
@@ -204,6 +218,9 @@ function getEnvConfig(env: OobEnv) {
     ),
     minTokenLength: intVal(env.TOKEN_MIN_LENGTH, DEFAULTS.minTokenLength),
     maxTokenLength: intVal(env.TOKEN_MAX_LENGTH, DEFAULTS.maxTokenLength),
+    requireSignedTokens: falseByDefault(env.REQUIRE_SIGNED_TOKENS),
+    skipRateLimit: trueByDefault(env.SKIP_RATE_LIMIT),
+    skipRecentTokens: trueByDefault(env.SKIP_RECENT_TOKENS),
   };
 }
 
@@ -213,6 +230,66 @@ function parseToken(raw: string | null, config: ReturnType<typeof getEnvConfig>)
   if (token.length < config.minTokenLength || token.length > config.maxTokenLength) return null;
   if (!EVENT_TOKEN_RE.test(token)) return null;
   return token;
+}
+
+function bytesToHex(bytes: Uint8Array): string {
+  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+function hexToBytes(value: string): Uint8Array | null {
+  if (!/^[a-f0-9]+$/i.test(value) || value.length % 2 !== 0) return null;
+  return Uint8Array.from(value.match(/.{2}/g) || [], (pair) => Number.parseInt(pair, 16));
+}
+
+async function tokenSignature(secret: string, unsignedToken: string): Promise<Uint8Array> {
+  const key = await crypto.subtle.importKey(
+    "raw",
+    ENCODER.encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+  const digest = await crypto.subtle.sign("HMAC", key, ENCODER.encode(unsignedToken));
+  return new Uint8Array(digest).slice(0, 16);
+}
+
+function signedTokenPayload(raw: string): string {
+  const cleaned = raw
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9-]+/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-|-$/g, "");
+  return (cleaned || crypto.randomUUID().replace(/-/g, "")).slice(0, 27);
+}
+
+async function createSignedToken(env: OobEnv, label: string): Promise<string | null> {
+  const secret = env.TOKEN_HMAC_SECRET || "";
+  if (secret.length < 32) return null;
+  const prefix = signedTokenPayload(label).slice(0, 10);
+  const nonce = crypto.randomUUID().replace(/-/g, "").slice(0, 16);
+  const unsigned = `s1_${prefix}-${nonce}`;
+  const signature = bytesToHex(await tokenSignature(secret, unsigned));
+  return `${unsigned}_${signature}`;
+}
+
+async function isAcceptedToken(
+  env: OobEnv,
+  config: ReturnType<typeof getEnvConfig>,
+  token: string,
+): Promise<boolean> {
+  if (!config.requireSignedTokens) return true;
+  const secret = env.TOKEN_HMAC_SECRET || "";
+  if (secret.length < 32) return false;
+  const match = /^(s1_[A-Za-z0-9-]{1,27})_([a-f0-9]{32})$/i.exec(token);
+  if (!match) return false;
+  const actual = hexToBytes(match[2]);
+  if (!actual) return false;
+  const expected = await tokenSignature(secret, match[1]);
+  if (actual.length !== expected.length) return false;
+  let difference = 0;
+  for (let i = 0; i < actual.length; i += 1) difference |= actual[i] ^ expected[i];
+  return difference === 0;
 }
 
 function hasCrlfOrInvalid(header: string): boolean {
@@ -424,15 +501,17 @@ function maskedLogEntry(hit: OobHit): void {
 }
 
 async function recordHit(env: OobEnv, config: ReturnType<typeof getEnvConfig>, hit: OobHit): Promise<void> {
+  if (!await isAcceptedToken(env, config, hit.token)) return;
   maskedLogEntry(hit);
   if (!env.OOB) return;
   const prior = await readStorage(env, hit.token);
+  if (prior.length >= config.maxHitsPerToken) return;
   const deduped = [hit, ...prior].filter((entry, idx, arr) => arr.findIndex((x) => x.hit_id === entry.hit_id) === idx);
   deduped.sort((a, b) => (a.timestamp > b.timestamp ? -1 : 1));
   const limited = deduped.slice(0, config.maxHitsPerToken);
   await writeStorage(env, hit.token, config.hitTtlSeconds, limited);
 
-  if (hit.event_type === "callback_hit") {
+  if (hit.event_type === "callback_hit" && !config.skipRecentTokens) {
     const stored = await env.OOB.get<RecentTokenStorage>(RECENT_TOKENS_KEY, "json");
     const previous = stored?.tokens || [];
     const existing = previous.find((entry) => entry.token === hit.token);
@@ -444,6 +523,82 @@ async function recordHit(env: OobEnv, config: ReturnType<typeof getEnvConfig>, h
       expirationTtl: config.hitTtlSeconds,
     });
   }
+}
+
+function invalidTokenResponse(url: URL): Response {
+  if (/\.(gif|png)$/i.test(url.pathname)) {
+    return new Response(PIXEL_GIF, {
+      headers: {
+        "Content-Type": "image/gif",
+        "X-Route": "oob-pixel",
+      },
+    });
+  }
+
+  return jsonResponse({ error: "invalid token" }, 400);
+}
+
+function validateExplicitRouteToken(
+  url: URL,
+  config: ReturnType<typeof getEnvConfig>,
+): Response | null {
+  const parts = url.pathname.split("/").filter(Boolean);
+  const prefix = parts[0] || "";
+
+  if (ROUTE_PREFIXES.has(prefix) && parts[1] && parts[1] !== "hits" && parts[1] !== "admin") {
+    const rawToken = parts[1].replace(/\.(gif|png|js|json|txt)$/i, "");
+    if (!parseToken(rawToken, config)) return invalidTokenResponse(url);
+  }
+
+  if (["json", "js", "respond", "delay", "redirect", "redirect-chain", "r"].includes(prefix)) {
+    if (!parseToken(parts[1] || "", config)) return invalidTokenResponse(url);
+  }
+
+  if (url.pathname === "/oob" && (url.searchParams.has("token") || url.searchParams.has("t"))) {
+    if (!parseToken(url.searchParams.get("token") || url.searchParams.get("t"), config)) {
+      return invalidTokenResponse(url);
+    }
+  }
+
+  if (url.pathname === "/oob/hits") {
+    if (!parseToken(url.searchParams.get("token"), config)) return invalidTokenResponse(url);
+  }
+
+  return null;
+}
+
+function isCollectorRequest(request: Request, config: ReturnType<typeof getEnvConfig>): boolean {
+  const url = new URL(request.url);
+  const path = url.pathname;
+  if (
+    path === "/oob" ||
+    path.startsWith("/oob/") ||
+    path.startsWith("/monstera/") ||
+    path.startsWith("/json/") ||
+    path.startsWith("/js/") ||
+    path.startsWith("/respond/") ||
+    path.startsWith("/delay/") ||
+    path.startsWith("/redirect/") ||
+    path.startsWith("/redirect-chain/") ||
+    path.startsWith("/r/")
+  ) {
+    return true;
+  }
+
+  return extractToken(request, config) !== null;
+}
+
+function requestToken(request: Request, config: ReturnType<typeof getEnvConfig>): string | null {
+  const extracted = extractToken(request, config);
+  if (extracted) return extracted.token;
+
+  const url = new URL(request.url);
+  const parts = url.pathname.split("/").filter(Boolean);
+  if (parts[0] === "r" || (parts[0] === "oob" && parts[1] === "admin" && parts[2] === "responses")) {
+    return parseToken(parts[parts[0] === "r" ? 1 : 3] || "", config);
+  }
+
+  return null;
 }
 
 async function buildRecord(
@@ -825,6 +980,13 @@ async function manageResponsePlans(request: Request, env: OobEnv, config: Return
   const callbackToken = parseToken(String(existing?.callback_token || input.callback_token || ""), config);
   const finalToken = parseToken(String(existing?.final_token || input.final_token || ""), config);
   if (!startToken || !callbackToken || !finalToken) return jsonResponse({ error: "valid start, callback, and final tokens are required" }, 400);
+  if (
+    !await isAcceptedToken(env, config, startToken) ||
+    !await isAcceptedToken(env, config, callbackToken) ||
+    !await isAcceptedToken(env, config, finalToken)
+  ) {
+    return jsonResponse({ error: "signed start, callback, and final tokens are required" }, 400);
+  }
   const redirectHops = Number(input.redirect_hops ?? 0);
   if (!Number.isInteger(redirectHops) || redirectHops < 0 || redirectHops > MAX_RESPONSE_PLAN_HOPS) return jsonResponse({ error: `redirect_hops must be between 0 and ${MAX_RESPONSE_PLAN_HOPS}` }, 400);
   const redirectStatus = Number(input.redirect_status ?? 302);
@@ -892,9 +1054,17 @@ export async function handleOob(request: Request, env: OobEnv): Promise<Response
   const method = request.method.toUpperCase();
   const config = getEnvConfig(env);
 
+  if (!isCollectorRequest(request, config)) return null;
+
   if (!["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"].includes(method)) {
     return jsonResponse({ error: "method not allowed" }, 405);
   }
+
+  const invalidToken = validateExplicitRouteToken(url, config);
+  if (invalidToken) return invalidToken;
+
+  const token = requestToken(request, config);
+  if (token && !await isAcceptedToken(env, config, token)) return invalidTokenResponse(url);
 
   const authenticatedConsoleRead = method === "GET" && isAdminRequest(request, env) && (
     url.pathname === "/oob/admin/tokens" ||
@@ -902,7 +1072,7 @@ export async function handleOob(request: Request, env: OobEnv): Promise<Response
     url.pathname === "/oob/admin/responses" ||
     url.pathname.startsWith("/oob/admin/responses/")
   );
-  const allowed = authenticatedConsoleRead || await checkRateLimit(env, request, config.maxRequestsPerMinute);
+  const allowed = authenticatedConsoleRead || config.skipRateLimit || await checkRateLimit(env, request, config.maxRequestsPerMinute);
   if (!allowed) {
     return addRateLimitHeaders(jsonResponse({ error: "rate limit exceeded" }, 429), 0, config.maxRequestsPerMinute);
   }
@@ -925,7 +1095,7 @@ export async function handleOob(request: Request, env: OobEnv): Promise<Response
     }).filter((hit) => hit.event_type !== "hits_query");
 
     if (env.OOB) {
-      await recordHit(env, config, await buildRecord(request, token, "hits_query", config));
+      maskedLogEntry(await buildRecord(request, token, "hits_query", config));
       return jsonResponse({ token, event_type: "hits_query", count: filtered.length, hits: filtered.map(safePublicHit) });
     }
 
@@ -933,8 +1103,20 @@ export async function handleOob(request: Request, env: OobEnv): Promise<Response
   }
 
   if (url.pathname === "/oob/admin/tokens") {
-    if (method !== "GET") return jsonResponse({ error: "method not allowed" }, 405);
     if (!isAdminRequest(request, env)) return jsonResponse({ error: "missing or invalid admin credentials" }, 401);
+    if (method === "POST") {
+      let label = "callback";
+      try {
+        const input = await request.json<{ label?: unknown }>();
+        if (input.label !== undefined) label = String(input.label);
+      } catch {
+        return jsonResponse({ error: "invalid JSON body" }, 400);
+      }
+      const issued = await createSignedToken(env, label);
+      if (!issued) return jsonResponse({ error: "TOKEN_HMAC_SECRET must contain at least 32 characters" }, 503);
+      return jsonResponse({ token: issued });
+    }
+    if (method !== "GET") return jsonResponse({ error: "method not allowed" }, 405);
     if (!env.OOB) return jsonResponse({ error: "storage unavailable" }, 501);
 
     const limit = parseIntParam(url.searchParams.get("limit"), 10, 1, MAX_RECENT_TOKENS);
@@ -958,11 +1140,13 @@ export async function handleOob(request: Request, env: OobEnv): Promise<Response
         await writeStorage(env, token, config.hitTtlSeconds, remaining);
       } else {
         await env.OOB.delete(`hits:${token}`);
-        const stored = await env.OOB.get<RecentTokenStorage>(RECENT_TOKENS_KEY, "json");
-        const recent = (stored?.tokens || []).filter((entry) => entry.token !== token);
-        await env.OOB.put(RECENT_TOKENS_KEY, JSON.stringify({ tokens: recent }), {
-          expirationTtl: config.hitTtlSeconds,
-        });
+        if (!config.skipRecentTokens) {
+          const stored = await env.OOB.get<RecentTokenStorage>(RECENT_TOKENS_KEY, "json");
+          const recent = (stored?.tokens || []).filter((entry) => entry.token !== token);
+          await env.OOB.put(RECENT_TOKENS_KEY, JSON.stringify({ tokens: recent }), {
+            expirationTtl: config.hitTtlSeconds,
+          });
+        }
       }
       maskedLogEntry(await buildRecord(request, token, "admin_request", config));
       return jsonResponse({ token, deleted: true });
@@ -979,7 +1163,7 @@ export async function handleOob(request: Request, env: OobEnv): Promise<Response
       until: url.searchParams.get("until"),
     });
 
-    await recordHit(env, config, await buildRecord(request, token, "admin_request", config));
+    maskedLogEntry(await buildRecord(request, token, "admin_request", config));
     return jsonResponse({ token, event_type: "admin_request", count: filtered.length, hits: filtered });
   }
 

@@ -33,6 +33,10 @@ class MemoryKV {
 interface Env {
   OOB?: MemoryKV;
   ADMIN_TOKEN?: string;
+  TOKEN_HMAC_SECRET?: string;
+  REQUIRE_SIGNED_TOKENS?: string;
+  SKIP_RATE_LIMIT?: string;
+  SKIP_RECENT_TOKENS?: string;
   MAX_HITS_PER_TOKEN?: string;
   MAX_BODY_BYTES?: string;
   MAX_REQUESTS_PER_MINUTE?: string;
@@ -374,7 +378,7 @@ describe("oob callback routes", () => {
   });
 
   it("lists recently active callback tokens for admins", async () => {
-    const env = makeEnv();
+    const env = { ...makeEnv(), SKIP_RECENT_TOKENS: "false" } as Env;
     const first = token("l");
     const second = token("m");
 
@@ -399,6 +403,7 @@ describe("oob callback routes", () => {
   it("supports rate limits", async () => {
     const env = {
       ...makeEnv(),
+      SKIP_RATE_LIMIT: "false",
       MAX_REQUEST_BYTES_PER_MINUTE: "1",
     } as Env;
     const id = token("j");
@@ -408,6 +413,110 @@ describe("oob callback routes", () => {
 
     expect(first?.status).toBe(200);
     expect(second?.status).toBe(429);
+  });
+
+  it("does no KV work for invalid callback tokens", async () => {
+    const env = {
+      ...makeEnv(),
+      SKIP_RATE_LIMIT: "false",
+      SKIP_RECENT_TOKENS: "false",
+    } as Env;
+    const kv = env.OOB as MemoryKV;
+
+    const json = await handleOob(makeReq("/oob/too-short"), env as never);
+    const pixel = await handleOob(makeReq("/oob/bad!.gif"), env as never);
+    const query = await handleOob(makeReq("/oob?token=also-too-short"), env as never);
+    const unrelated = await handleOob(makeReq("/not-a-collector-route"), env as never);
+
+    expect(json?.status).toBe(400);
+    expect(pixel?.status).toBe(200);
+    expect(pixel?.headers.get("content-type")).toBe("image/gif");
+    expect(query?.status).toBe(400);
+    expect(unrelated).toBeNull();
+    expect(kv.reads).toBe(0);
+    expect(kv.writes).toBe(0);
+  });
+
+  it("accepts issued signed tokens and rejects forged valid-looking tokens without KV", async () => {
+    const env = {
+      ...makeEnv(),
+      TOKEN_HMAC_SECRET: "test-secret-with-at-least-32-characters",
+      REQUIRE_SIGNED_TOKENS: "true",
+    } as Env;
+    const kv = env.OOB as MemoryKV;
+
+    const issuedResponse = await handleOob(
+      makeReq("/oob/admin/tokens", {
+        method: "POST",
+        headers: { ...adminHeaders(), "content-type": "application/json" },
+        body: JSON.stringify({ label: "ssrf-test" }),
+      }),
+      env as never,
+    );
+    const issued = (await issuedResponse?.json())?.token as string;
+
+    expect(issued).toMatch(/^s1_ssrf-test-[a-f0-9]{16}_[a-f0-9]{32}$/);
+    expect(kv.reads).toBe(0);
+    expect(kv.writes).toBe(0);
+
+    const forged = await handleOob(
+      makeReq(`/oob/s1_ssrf-test-0000000000000000_${"0".repeat(32)}`),
+      env as never,
+    );
+    expect(forged?.status).toBe(400);
+    expect(kv.reads).toBe(0);
+    expect(kv.writes).toBe(0);
+
+    const accepted = await handleOob(makeReq(`/oob/${issued}`), env as never);
+    expect(accepted?.status).toBe(200);
+
+    const monsteraToken = "s1_oob-api-ex-71f90e77d14baf36_356fc8fd232fad4ca73fe7cc57659e86";
+    const monsteraAccepted = await handleOob(makeReq(`/oob/${monsteraToken}`), {
+      ...env,
+      TOKEN_HMAC_SECRET: "12345678901234567890123456789012",
+    } as never);
+    expect(monsteraAccepted?.status).toBe(200);
+    expect(kv.reads).toBe(2);
+    expect(kv.writes).toBe(2);
+  });
+
+  it("skips rate-limit and recent-token KV operations by default", async () => {
+    const env = makeEnv();
+    const kv = env.OOB as MemoryKV;
+    const id = token("n");
+
+    await handleOob(makeReq(`/oob/${id}`), env as never);
+
+    expect(kv.reads).toBe(1);
+    expect(kv.writes).toBe(1);
+  });
+
+  it("keeps hit polling read-only in KV", async () => {
+    const env = makeEnv();
+    const kv = env.OOB as MemoryKV;
+    const id = token("o");
+
+    await handleOob(makeReq(`/oob/${id}`), env as never);
+    const readsAfterCallback = kv.reads;
+    const writesAfterCallback = kv.writes;
+
+    await handleOob(makeReq(`/oob/hits?token=${id}`), env as never);
+
+    expect(kv.reads).toBe(readsAfterCallback + 1);
+    expect(kv.writes).toBe(writesAfterCallback);
+  });
+
+  it("stops rewriting KV after a token reaches its hit cap", async () => {
+    const env = makeEnv();
+    const kv = env.OOB as MemoryKV;
+    const id = token("p");
+
+    await handleOob(makeReq(`/oob/${id}`), env as never);
+    await handleOob(makeReq(`/oob/${id}`), env as never);
+    await handleOob(makeReq(`/oob/${id}`), env as never);
+
+    expect(kv.reads).toBe(3);
+    expect(kv.writes).toBe(2);
   });
 
   it("supports public filtering by hit id and event type", async () => {

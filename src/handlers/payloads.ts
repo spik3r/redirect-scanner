@@ -1,4 +1,5 @@
 import { baseLog, logEntry } from "../lib/log";
+import { isSafeJsonpCallback } from "./oob";
 
 /**
  * Payload generation helpers for various content types.
@@ -19,6 +20,8 @@ function jsonResponse(data: unknown, status = 200): Response {
 
 export function jsonPayload(request: Request): Response {
   const cb = getParam(request, "callback");
+  const statusParam = Number(getParam(request, "status") || "200");
+  const status = Number.isFinite(statusParam) ? Math.min(599, Math.max(200, Math.floor(statusParam))) : 200;
   const log = baseLog(request);
   logEntry({ ...log, event: "payload:json", callback: cb || undefined });
 
@@ -28,13 +31,21 @@ export function jsonPayload(request: Request): Response {
     message: "This is a JSON webhook response",
     data: { id: 1, name: "test" },
   };
+  const payload = JSON.stringify(body);
 
   if (cb) {
-    return new Response(`${cb}(${JSON.stringify(body)})`, {
+    if (!isSafeJsonpCallback(cb)) {
+      return new Response(JSON.stringify({ error: "invalid callback" }), {
+        status: 400,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    return new Response(`${cb}(${payload})`, {
+      status,
       headers: { "Content-Type": "application/javascript" },
     });
   }
-  return jsonResponse(body);
+  return jsonResponse(body, status);
 }
 
 export function yamlPayload(request: Request): Response {
@@ -110,15 +121,28 @@ export function htmlPayload(request: Request): Response {
 export function jsPayload(request: Request): Response {
   const cb = getParam(request, "callback");
   const log = baseLog(request);
-  logEntry({ ...log, event: "payload:js", callback: cb || undefined });
+  const statusParam = Number(getParam(request, "status") || "200");
+  const status = Number.isFinite(statusParam) ? Math.min(599, Math.max(200, Math.floor(statusParam))) : 200;
+  const message = getParam(request, "message") || `Webhook JS payload loaded at ${new Date().toISOString()}`;
+  const safeMessage = message.replace(/[\r\n]/g, " ").slice(0, 2048);
+  logEntry({ ...log, event: "payload:js", callback: cb || undefined, status });
+
+  const callback = cb ? cb.trim() : "";
+  if (cb && !isSafeJsonpCallback(callback)) {
+    return new Response("", {
+      status: 400,
+      headers: { "Content-Type": "application/javascript" },
+    });
+  }
 
   const body = `// JavaScript webhook response
 (function() {
-  console.log("Webhook JS payload loaded at ${new Date().toISOString()}");
-  ${cb ? `\n  // Callback requested: ${cb}\n  if (typeof ${cb} === "function") {\n    ${cb}({ status: "ok", timestamp: "${new Date().toISOString()}" });\n  }` : ""}
+  console.log("${safeMessage.replace(/\"/g, "\\\"")}");
+  ${callback ? `if (typeof ${callback} === "function") { ${callback}({ status: "ok", timestamp: "${new Date().toISOString()}" }); }` : ""}
 })();`;
 
   return new Response(body, {
+    status,
     headers: { "Content-Type": "application/javascript" },
   });
 }
